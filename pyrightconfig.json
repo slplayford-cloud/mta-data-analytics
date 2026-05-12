@@ -1,0 +1,11 @@
+{
+  "venvPath": "/home/splay/mta-data-analytics",
+  "venv": ".venv",
+  "reportMissingModuleSource": "none",
+  "reportMissingTypeStubs": "none",
+  "reportAttributeAccessIssue": "none",
+  "reportUnknownMemberType": "none",
+  "reportUnknownVariableType": "none",
+  "reportUnknownArgumentType": "none",
+  "reportUnknownParameterType": "none"
+}

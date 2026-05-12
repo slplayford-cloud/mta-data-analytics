@@ -1,0 +1,2 @@
+requests==2.34.0
+gtfs-realtime-bindings==1.0.0

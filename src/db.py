@@ -2,6 +2,8 @@
 
 import duckdb
 from src.models import Train
+from datetime import date
+from typing import Any, cast
 
 def get_connection(db_name: str):
     return duckdb.connect(db_name)
@@ -104,30 +106,30 @@ def create_tables(conn: duckdb.DuckDBPyConnection):
     """)
     
 
-def initialize(conn: duckdb.DuckDBPyConnection):
+def initialize(conn: duckdb.DuckDBPyConnection, static_dir: str):
 
     result = conn.execute("SELECT value FROM _meta WHERE key = 'static_loaded'").fetchone()
     if result:
         return
 
     _ = conn.execute(
-    """
-    INSERT INTO calendar SELECT * FROM read_csv_auto('static/calendar.txt', dateformat='%Y%m%d')
+    f"""
+    INSERT INTO calendar SELECT * FROM read_csv_auto('{static_dir}calendar.txt', dateformat='%Y%m%d')
     """)
     _ = conn.execute(
-    """
+    f"""
     INSERT INTO routes
     SELECT route_id, route_short_name AS short_name, route_long_name AS long_name, route_color, route_text_color
-    FROM read_csv_auto('static/routes.txt')
+    FROM read_csv_auto('{static_dir}routes.txt')
     """)
     _ = conn.execute(
-    """
-    INSERT INTO stops SELECT * FROM read_csv_auto('static/stops.txt')
+    f"""
+    INSERT INTO stops SELECT * FROM read_csv_auto('{static_dir}stops.txt')
     """)
 
     # MUST USE A REGEX TO EXTRACT THE TRIP KEY
     _ = conn.execute(
-    r"""
+    fr"""
     INSERT INTO trips
     SELECT
         trip_id,
@@ -137,14 +139,14 @@ def initialize(conn: duckdb.DuckDBPyConnection):
         direction_id,
         shape_id,
         regexp_extract(trip_id, '_(\d+_.+)$', 1) AS rt_trip_key
-    FROM read_csv_auto('static/trips.txt')
+    FROM read_csv_auto('{static_dir}trips.txt')
     """)
     _ = conn.execute(
-    """
-    INSERT INTO transfers SELECT * FROM read_csv_auto('static/transfers.txt')
+    f"""
+    INSERT INTO transfers SELECT * FROM read_csv_auto('{static_dir}transfers.txt')
     """)
     _ = conn.execute(
-    """
+    f"""
     INSERT INTO stop_times 
     SELECT
         trip_id,
@@ -157,13 +159,37 @@ def initialize(conn: duckdb.DuckDBPyConnection):
         CAST(split_part(departure_time, ':', 2) AS INTEGER) * 60 +
         CAST(split_part(departure_time, ':', 3) AS INTEGER) AS departure_seconds,
         stop_sequence
-    FROM read_csv_auto('static/stop_times.txt')
+    FROM read_csv_auto('{static_dir}stop_times.txt')
     """)
 
     _ = conn.execute("INSERT INTO _meta VALUES ('static_loaded', 'true')")
 
-def get_scheduled_arrival(conn, trains: list[Train]):
+def write_observations(conn: duckdb.DuckDBPyConnection, trains: list[Train]):
     pass
+
+def get_scheduled_arrival(conn: duckdb.DuckDBPyConnection, rt_trip_id: str, stop_id: str, service_date: date) -> int | None:
+    row = conn.execute(
+    """
+    SELECT st.arrival_seconds
+    FROM stop_times st
+    JOIN trips t ON st.trip_id = t.trip_id
+    JOIN calendar c ON t.service_id = c.service_id
+    WHERE t.rt_trip_key = ?
+      AND st.stop_id = ?
+      AND c.start_date <= ?
+      AND c.end_date >= ?
+      AND CASE dayofweek(?)
+          WHEN 0 THEN c.sunday
+          WHEN 1 THEN c.monday
+          WHEN 2 THEN c.tuesday
+          WHEN 3 THEN c.wednesday
+          WHEN 4 THEN c.thursday
+          WHEN 5 THEN c.friday
+          WHEN 6 THEN c.saturday
+      END
+    """, [rt_trip_id, stop_id, service_date, service_date, service_date]).fetchone()
+
+    return row[0] if row else None
 
 
 # MAIN EXECUTION
@@ -171,7 +197,7 @@ def get_scheduled_arrival(conn, trains: list[Train]):
 def main():
     conn = get_connection("mta.duckdb")
     create_tables(conn)
-    initialize(conn)
+    initialize(conn, static_dir="static/")
 
     counts = {
         "calendar":   conn.execute("SELECT COUNT(*) FROM calendar").fetchone()[0],
@@ -186,6 +212,28 @@ def main():
 
     max_arrival = conn.execute("SELECT MAX(arrival_seconds) FROM stop_times").fetchone()[0]
     print(f"\nmax arrival_seconds: {max_arrival}  (expect > 86400)")
+
+    today = date.today()
+    day_col = today.strftime("%A").lower()
+    sample = conn.execute(f"""
+        SELECT t.rt_trip_key, st.stop_id, st.arrival_seconds
+        FROM trips t
+        JOIN stop_times st ON st.trip_id = t.trip_id
+        JOIN calendar c    ON c.service_id = t.service_id
+        WHERE t.rt_trip_key IS NOT NULL
+          AND c.{day_col} = true
+          AND c.start_date <= ?
+          AND c.end_date   >= ?
+        LIMIT 1
+    """, [today, today]).fetchone()
+
+    if sample is None:
+        print("\nNo trips running today — skipping get_scheduled_arrival test.")
+    else:
+        rt_key, stop_id, expected = sample
+        result = get_scheduled_arrival(conn, rt_key, stop_id, today)
+        print(f"\nget_scheduled_arrival({rt_key!r}, {stop_id!r})")
+        print(f"  expected : {expected}  returned : {result}  {'PASS' if result == expected else 'FAIL'}")
 
 if __name__ == '__main__':
     main()

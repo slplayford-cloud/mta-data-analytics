@@ -2,7 +2,6 @@
 
 from src.graph import SubwayGraph
 from src.db import get_connection, create_tables, initialize
-from typing import cast
 import networkx as nx
 
 

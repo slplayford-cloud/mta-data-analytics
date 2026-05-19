@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import duckdb
+from src.models import Train
 
 def get_connection(db_name: str):
     return duckdb.connect(db_name)
@@ -160,6 +161,10 @@ def initialize(conn: duckdb.DuckDBPyConnection):
     """)
 
     _ = conn.execute("INSERT INTO _meta VALUES ('static_loaded', 'true')")
+
+def get_scheduled_arrival(conn, trains: list[Train]):
+    pass
+
 
 # MAIN EXECUTION
 

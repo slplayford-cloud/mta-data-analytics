@@ -15,7 +15,7 @@ class Station:
     name: str
     lat: float
     lon: float
-    routes: list[Route] = field(default_factory=list)
+    routes: list[str] = field(default_factory=list)
 
 @dataclass
 class Trip:

@@ -3,7 +3,6 @@
 import duckdb
 from src.models import Train
 from datetime import date
-from typing import Any, cast
 
 def get_connection(db_name: str):
     return duckdb.connect(db_name)
@@ -104,6 +103,46 @@ def create_tables(conn: duckdb.DuckDBPyConnection):
         value   VARCHAR
     );
     """)
+
+    _ = conn.execute("CREATE SEQUENCE IF NOT EXISTS obs_seq;")
+    _ = conn.execute(
+    """
+    CREATE TABLE IF NOT EXISTS train_observations (
+        id                          UINTEGER PRIMARY KEY DEFAULT nextval('obs_seq'),
+        observed_at                 TIMESTAMPTZ NOT NULL,
+        service_date                DATE NOT NULL,
+        rt_trip_id                  VARCHAR NOT NULL,
+        route_id                    VARCHAR NOT NULL,
+        direction                   CHAR(1),
+        headsign                    VARCHAR,
+        location_stop_id            VARCHAR,
+        location_parent_station     VARCHAR,
+        location_status             VARCHAR,
+        last_position_update        TIMESTAMPTZ,
+        has_delay_alert             BOOLEAN DEFAULT FALSE,
+        delay_seconds               INTEGER,
+        next_stop_id                VARCHAR,
+        next_stop_predicted_arrival TIMESTAMPTZ
+    );
+    """)
+    _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_obs_route    ON train_observations(route_id, observed_at)")
+    _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_obs_station  ON train_observations(location_parent_station, observed_at)")
+    _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_obs_tripdate ON train_observations(rt_trip_id, service_date)")
+
+    # Per-stop predictions (training labels for future ML models)
+    _ = conn.execute(
+    """
+    CREATE TABLE IF NOT EXISTS stop_predictions (
+        observation_id            UINTEGER NOT NULL,
+        stop_id                   VARCHAR NOT NULL,
+        stop_sequence             SMALLINT NOT NULL,
+        predicted_arrival         TIMESTAMPTZ,
+        scheduled_arrival_seconds INTEGER,
+        PRIMARY KEY (observation_id, stop_sequence)
+    );
+    """)
+    _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_pred_obs ON stop_predictions(observation_id);")
+
     
 
 def initialize(conn: duckdb.DuckDBPyConnection, static_dir: str):
@@ -151,7 +190,7 @@ def initialize(conn: duckdb.DuckDBPyConnection, static_dir: str):
     SELECT
         trip_id,
         stop_id,
-        stop_id[:-1] AS parent_station,
+        LEFT(stop_id, LENGTH(stop_id) - 1) AS parent_station,
         CAST(split_part(arrival_time, ':', 1) AS INTEGER) * 3600 +
         CAST(split_part(arrival_time, ':', 2) AS INTEGER) * 60 +
         CAST(split_part(arrival_time, ':', 3) AS INTEGER) AS arrival_seconds,

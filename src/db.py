@@ -226,6 +226,8 @@ def get_scheduled_arrival(conn: duckdb.DuckDBPyConnection, rt_trip_id: str, stop
           WHEN 5 THEN c.friday
           WHEN 6 THEN c.saturday
       END
+    ORDER BY (c.end_date - c.start_date) ASC
+    LIMIT 1
     """, [rt_trip_id, stop_id, service_date, service_date, service_date]).fetchone()
 
     return row[0] if row else None

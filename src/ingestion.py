@@ -33,24 +33,33 @@ def main():
 
 
     db_connection = get_connection("mta.duckdb")
+    total = 1
 
-    for line in ("1"):
+    for line in _all_lines():
         feed = get_feed(line)
         if not feed:
            continue 
 
         train_line = feed.filter_trips(underway=True)
-        for i, trip in enumerate(train_line):
+        for trip in train_line:
             # TODO: Analyze each trip
             arrival_time = get_scheduled_arrival(
                    conn=db_connection,
                    rt_trip_id=trip.trip_id,
                    stop_id=trip.location,
-                   service_date=date.today()
+                   service_date=trip.start_date
                 )
-            print(train_line[i]) 
-            print(f'Route: {trip.route_id} Status: {trip.location_status} {trip.location} Arrival: {arrival_time}')
-            print()
+            total += 1 
+
+    print(total)
+            # if arrival_time is None:
+            #     print(f'Error #: {total}')
+            #     print(f'Trip id: {trip.trip_id}') 
+            #     print(f'Stop id: {trip.location}')
+            #     print(f'Date: {trip.start_date}')
+            #     #print(f'Route: {trip.route_id} Status: {trip.location_status} {trip.location} Arrival: {arrival_time}')
+            #     print()
+            #     total += 1
             #print(trip)
     
 

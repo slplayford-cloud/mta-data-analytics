@@ -3,7 +3,7 @@
 import re
 import duckdb
 from src.models import Train
-from datetime import date
+from datetime import date, datetime
 
 def get_connection(db_name: str):
     return duckdb.connect(db_name)
@@ -204,8 +204,62 @@ def initialize(conn: duckdb.DuckDBPyConnection, static_dir: str):
 
     _ = conn.execute("INSERT INTO _meta VALUES ('static_loaded', 'true')")
 
-def write_observations(conn: duckdb.DuckDBPyConnection, trains: list[Train]):
-    pass
+def write_observation(
+    conn: duckdb.DuckDBPyConnection,
+    train: Train,
+    service_date: date,
+    stop_preds: list[tuple[str, int, datetime | None, int | None]] | None = None,
+) -> None:
+    """
+    stop_preds: list of (stop_id, stop_sequence, predicted_arrival, scheduled_arrival_seconds)
+    ordered by stop_sequence; first entry becomes next_stop on the observation row.
+    """
+    next_stop_id = stop_preds[0][0] if stop_preds else None
+    next_stop_predicted_arrival = stop_preds[0][2] if stop_preds else None
+
+    conn.begin()
+    try:
+        obs_id = conn.execute(
+            """
+            INSERT INTO train_observations (
+                observed_at, service_date, rt_trip_id, route_id, direction, headsign,
+                location_stop_id, location_parent_station, location_status,
+                last_position_update, has_delay_alert, delay_seconds,
+                next_stop_id, next_stop_predicted_arrival
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            RETURNING id
+            """,
+            [
+                train.observed_at,
+                service_date,
+                train.trip_id,
+                train.route_id,
+                train.direction,
+                train.headsign,
+                train.location_stop_id,
+                train.location_parent_station,
+                train.location_status,
+                train.last_position_update,
+                train.has_delay_alert,
+                train.delay_seconds,
+                next_stop_id,
+                next_stop_predicted_arrival,
+            ],
+        ).fetchone()[0]
+
+        if stop_preds:
+            conn.executemany(
+                """
+                INSERT INTO stop_predictions
+                    (observation_id, stop_id, stop_sequence, predicted_arrival, scheduled_arrival_seconds)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                [(obs_id, sid, seq, arr, sched) for sid, seq, arr, sched in stop_preds],
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 def get_scheduled_arrival(conn: duckdb.DuckDBPyConnection, rt_trip_id: str, stop_id: str, service_date: date) -> int | None:
     trip_key = re.sub(r'\bSI\.(N|S)', r'SI..\1', rt_trip_id)

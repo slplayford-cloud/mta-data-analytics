@@ -3,7 +3,6 @@
 Collects data from MTA realtime feed and adds observations into the realtime database
 Should be run consistently to collect data feeds
 """
-from datetime import date
 from nyct_gtfs import NYCTFeed
 from src.db import get_connection, get_scheduled_arrival, write_observations
 import logging
@@ -49,18 +48,19 @@ def main():
                    stop_id=trip.location,
                    service_date=trip.start_date
                 )
-            total += 1 
+
+            if arrival_time is None:
+                print(f'Error #: {total}')
+                print(f'Trip id: {trip.trip_id}') 
+                print(f'Stop id: {trip.location}')
+                print(f'Date: {trip.start_date}')
+                #print(f'Route: {trip.route_id} Status: {trip.location_status} {trip.location} Arrival: {arrival_time}')
+                print()
+                total += 1 
+            # print(f'trip: {trip.trip_id} ETA: {arrival_time}')
+
 
     print(total)
-            # if arrival_time is None:
-            #     print(f'Error #: {total}')
-            #     print(f'Trip id: {trip.trip_id}') 
-            #     print(f'Stop id: {trip.location}')
-            #     print(f'Date: {trip.start_date}')
-            #     #print(f'Route: {trip.route_id} Status: {trip.location_status} {trip.location} Arrival: {arrival_time}')
-            #     print()
-            #     total += 1
-            #print(trip)
     
 
 

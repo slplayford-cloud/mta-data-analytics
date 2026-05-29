@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import re
 import duckdb
 from src.models import Train
 from datetime import date
@@ -207,13 +208,15 @@ def write_observations(conn: duckdb.DuckDBPyConnection, trains: list[Train]):
     pass
 
 def get_scheduled_arrival(conn: duckdb.DuckDBPyConnection, rt_trip_id: str, stop_id: str, service_date: date) -> int | None:
+    trip_key = re.sub(r'\bSI\.(N|S)', r'SI..\1', rt_trip_id)
+    trip_key_prefix = re.sub(r'(\.\.[NS]X?)\w+$', r'\1', trip_key) + '%'
     row = conn.execute(
     """
     SELECT st.arrival_seconds
     FROM stop_times st
     JOIN trips t ON st.trip_id = t.trip_id
     JOIN calendar c ON t.service_id = c.service_id
-    WHERE t.rt_trip_key = ?
+    WHERE t.rt_trip_key LIKE ?
       AND st.stop_id = ?
       AND c.start_date <= ?
       AND c.end_date >= ?
@@ -228,7 +231,7 @@ def get_scheduled_arrival(conn: duckdb.DuckDBPyConnection, rt_trip_id: str, stop
       END
     ORDER BY (c.end_date - c.start_date) ASC
     LIMIT 1
-    """, [rt_trip_id, stop_id, service_date, service_date, service_date]).fetchone()
+    """, [trip_key_prefix, stop_id, service_date, service_date, service_date]).fetchone()
 
     return row[0] if row else None
 

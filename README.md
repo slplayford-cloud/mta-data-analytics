@@ -33,76 +33,97 @@ src/analytics.py   Query functions over accumulated observations (planned)
 3. **Delay computation** — for each train, the first upcoming stop with a predicted arrival is matched against the static schedule. `delay_seconds = predicted − scheduled` (positive = late, negative = early, `None` = no schedule match).
 
 ```mermaid
-flowchart TD
-      subgraph CSV["Static GTFS CSVs (static/)"]
-          stops_csv[stops.txt]
-          routes_csv[routes.txt]
-          trips_csv[trips.txt]
-          st_csv[stop_times.txt]
-          cal_csv[calendar.txt]
-          trans_csv[transfers.txt]
-      end
+erDiagram
+    stops {
+        varchar stop_id PK
+        varchar stop_name
+        double stop_lat
+        double stop_lon
+        tinyint location_type
+        varchar parent_station FK
+    }
+    routes {
+        varchar route_id PK
+        varchar short_name
+        varchar long_name
+        varchar route_color
+        varchar route_text_color
+    }
+    calendar {
+        varchar service_id PK
+        bool monday
+        bool tuesday
+        bool wednesday
+        bool thursday
+        bool friday
+        bool saturday
+        bool sunday
+        date start_date
+        date end_date
+    }
+    trips {
+        varchar trip_id PK
+        varchar route_id FK
+        varchar service_id FK
+        varchar headsign
+        tinyint direction_id
+        varchar shape_id
+        varchar rt_trip_key
+    }
+    stop_times {
+        varchar trip_id FK
+        varchar stop_id FK
+        varchar parent_station
+        int arrival_seconds
+        int departure_seconds
+        smallint stop_sequence
+    }
+    transfers {
+        varchar from_stop_id FK
+        varchar to_stop_id FK
+        tinyint transfer_type
+        int min_transfer_time
+    }
+    _meta {
+        varchar key PK
+        varchar value
+    }
+    train_observations {
+        uinteger id PK
+        timestamptz observed_at
+        date service_date
+        varchar rt_trip_id FK
+        varchar route_id FK
+        char direction
+        varchar headsign
+        varchar location_stop_id FK
+        varchar location_parent_station FK
+        varchar location_status
+        timestamptz last_position_update
+        bool has_delay_alert
+        int delay_seconds
+        varchar next_stop_id
+        timestamptz next_stop_predicted_arrival
+    }
+    stop_predictions {
+        uinteger observation_id FK
+        varchar stop_id FK
+        smallint stop_sequence
+        timestamptz predicted_arrival
+        int scheduled_arrival_seconds
+    }
 
-      subgraph DB["DuckDB (mta.duckdb)"]
-          subgraph static_t["Static Tables"]
-              stops_t[(stops)]
-              routes_t[(routes)]
-              trips_t[(trips + rt_trip_key)]
-              st_t[(stop_times + parent_station + _seconds)]
-              cal_t[(calendar)]
-              trans_t[(transfers)]
-              meta[(_meta guard)]
-          end
-          subgraph rt_t["Realtime Tables"]
-              obs[(train_observations)]
-              pred[(stop_predictions)]
-          end
-      end
-
-      subgraph Models["Dataclasses (models.py)"]
-          Station
-          Route
-          Trip
-          StopTime
-          Train
-      end
-
-      subgraph Graph["NetworkX Graph (graph.py)"]
-          nodes[Station nodes]
-          redges[Route edges · weight = median travel time]
-          tedges[Transfer edges · weight = min_transfer_time]
-      end
-
-      subgraph Feed["ingestion.py"]
-          nyct[NYCTFeed × 8 feed groups]
-          poller[Poller · 30s cycle]
-      end
-
-      subgraph Analytics["analytics.py"]
-          q1[avg_delay_by_route]
-          q2[on_time_pct_by_station]
-          q3[delay_trend]
-      end
-      
-      stops_csv & routes_csv & trips_csv & st_csv & cal_csv & trans_csv -->|db.initialize| DB
-
-      stops_t --> Station
-      routes_t --> Route
-      trips_t --> Trip
-      st_t --> StopTime
-
-      stops_t -->|parent stations| nodes
-      st_t -->|self-join: consecutive stops per trip| redges
-      trans_t -->|from != to rows| tedges
-
-      poller -->|every 30s| nyct
-      nyct -->|parse_train| Train
-      cal_t & st_t -->|lookup_scheduled_arrival| Train
-      Train -->|write_observations| obs & pred
-      Train -->|update_trains| nodes
-
-      obs --> q1 & q2 & q3
-      pred -->|future ML labels| Analytics
+    stops ||--o{ stops                : "parent_station → stop_id (platforms point to their parent)"
+    routes ||--o{ trips               : "route_id → route_id"
+    routes ||--o{ train_observations  : "route_id → route_id"
+    calendar ||--o{ trips             : "service_id → service_id"
+    trips ||--o{ stop_times           : "trip_id → trip_id"
+    trips ||--o{ train_observations   : "rt_trip_key → rt_trip_id"
+    stops ||--o{ stop_times           : "stop_id → stop_id"
+    stops ||--o{ transfers            : "stop_id → from_stop_id and to_stop_id"
+    stops ||--o{ train_observations   : "stop_id → location_stop_id and location_parent_station"
+    stops ||--o{ stop_predictions     : "stop_id → stop_id"
+    train_observations ||--o{ stop_predictions : "id → observation_id"
 ```
 ---
 

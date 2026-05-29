@@ -32,6 +32,78 @@ src/analytics.py   Query functions over accumulated observations (planned)
 2. **Live polling** — `Poller._poll_once()` fetches all 8 MTA feed groups, converts each underway trip into a `Train` object, looks up the scheduled arrival for each remaining stop, stores the observation and per-stop predictions, then updates the graph with current train positions.
 3. **Delay computation** — for each train, the first upcoming stop with a predicted arrival is matched against the static schedule. `delay_seconds = predicted − scheduled` (positive = late, negative = early, `None` = no schedule match).
 
+```mermaid
+flowchart TD
+      subgraph CSV["Static GTFS CSVs (static/)"]
+          stops_csv[stops.txt]
+          routes_csv[routes.txt]
+          trips_csv[trips.txt]
+          st_csv[stop_times.txt]
+          cal_csv[calendar.txt]
+          trans_csv[transfers.txt]
+      end
+
+      subgraph DB["DuckDB (mta.duckdb)"]
+          subgraph static_t["Static Tables"]
+              stops_t[(stops)]
+              routes_t[(routes)]
+              trips_t[(trips + rt_trip_key)]
+              st_t[(stop_times + parent_station + _seconds)]
+              cal_t[(calendar)]
+              trans_t[(transfers)]
+              meta[(_meta guard)]
+          end
+          subgraph rt_t["Realtime Tables"]
+              obs[(train_observations)]
+              pred[(stop_predictions)]
+          end
+      end
+
+      subgraph Models["Dataclasses (models.py)"]
+          Station
+          Route
+          Trip
+          StopTime
+          Train
+      end
+
+      subgraph Graph["NetworkX Graph (graph.py)"]
+          nodes[Station nodes]
+          redges[Route edges · weight = median travel time]
+          tedges[Transfer edges · weight = min_transfer_time]
+      end
+
+      subgraph Feed["ingestion.py"]
+          nyct[NYCTFeed × 8 feed groups]
+          poller[Poller · 30s cycle]
+      end
+
+      subgraph Analytics["analytics.py"]
+          q1[avg_delay_by_route]
+          q2[on_time_pct_by_station]
+          q3[delay_trend]
+      end
+      
+      stops_csv & routes_csv & trips_csv & st_csv & cal_csv & trans_csv -->|db.initialize| DB
+
+      stops_t --> Station
+      routes_t --> Route
+      trips_t --> Trip
+      st_t --> StopTime
+
+      stops_t -->|parent stations| nodes
+      st_t -->|self-join: consecutive stops per trip| redges
+      trans_t -->|from != to rows| tedges
+
+      poller -->|every 30s| nyct
+      nyct -->|parse_train| Train
+      cal_t & st_t -->|lookup_scheduled_arrival| Train
+      Train -->|write_observations| obs & pred
+      Train -->|update_trains| nodes
+
+      obs --> q1 & q2 & q3
+      pred -->|future ML labels| Analytics
+```
 ---
 
 ## Project Layout

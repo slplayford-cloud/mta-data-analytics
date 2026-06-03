@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """
 MTA real-time ingestion — tracks expected vs actual arrivals per station.
-Schedule baseline loaded from Supabase stop_times; RT feed used for departure detection.
+Only tracks trips from their origin. Mid-trip trains are ignored.
 
 Run: python -m src.ingestion
 """
 
 import os
-import re
 import time
 import logging
-from datetime import date, datetime, time as dtime, timedelta
-from typing import Any, cast
+from datetime import datetime
+from typing import Any
 
 from supabase import create_client, Client
 from nyct_gtfs import NYCTFeed
@@ -19,18 +18,18 @@ from nyct_gtfs.trip import Trip
 
 log = logging.getLogger(__name__)
 
-FEED_LINE     = "1"
 POLL_INTERVAL = 30  # seconds
 
 # ── in-memory state ───────────────────────────────────────────────────────────
 
-# trip_id → {stop_id → scheduled_arrival}
-# Loaded from Supabase on startup; written when a new trip is first seen.
-_schedules: dict[str, dict[str, datetime]] = {}
+# trip_id → {stop_id → (scheduled_arrival, stop_sequence)}
+# Only populated for trips captured before departure — i + 1 is accurate
+# when stop_time_updates contains the full route (train not yet underway).
+_schedules: dict[str, dict[str, tuple[datetime, int]]] = {}
 
-# trip_id → {stop_id → (predicted_arrival, stop_name, stop_sequence)}
+# trip_id → {stop_id → (predicted_arrival, stop_name)}
 # Rebuilt every poll. A stop disappearing = train departed that stop.
-_last_predictions: dict[str, dict[str, tuple[datetime | None, str | None, int]]] = {}
+_last_predictions: dict[str, dict[str, tuple[datetime | None, str | None]]] = {}
 
 # ── supabase ──────────────────────────────────────────────────────────────────
 
@@ -38,95 +37,44 @@ def get_client() -> Client:
     return create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
 
 
-def _fetch_schedule_from_static(
-    db: Client,
-    rt_trip_id: str,
-    start_date: date,
-) -> dict[str, datetime]:
-    """
-    Query stop_times for the scheduled arrivals for a given RT trip.
-    Uses a LIKE prefix on rt_trip_key to handle the static/RT id mismatch.
-    Returns {stop_id → scheduled_arrival datetime}, empty dict if no match.
-    """
-    prefix = re.sub(r'(\.\.[NS]X?)\w+$', r'\1', rt_trip_id) + '%'
-    response = (
-        db.table("stop_times")
-        .select("stop_id, arrival_seconds")
-        .like("rt_trip_key", prefix)
-        .order("stop_sequence")
-        .execute()
-    )
-    rows = cast(list[dict[str, Any]], response.data)
-    if not rows:
-        return {}
-    midnight = datetime.combine(start_date, dtime.min)
-    return {
-        row["stop_id"]: midnight + timedelta(seconds=int(row["arrival_seconds"]))
-        for row in rows
-    }
-
-
-def load_active_schedules(db: Client) -> None:
-    """
-    Warm _schedules from trip_schedules for any trips already underway
-    at startup (crash recovery). New trips will lazy-load from stop_times.
-    """
-    response = (
-        db.table("trip_schedules")
-        .select("trip_id, stops")
-        .eq("is_active", True)
-        .execute()
-    )
-    rows = cast(list[dict[str, Any]], response.data)
-    for row in rows:
-        sched: dict[str, datetime] = {}
-        for stop in cast(list[dict[str, Any]], row["stops"]):
-            sched_arr: str | None = stop.get("sched_arr")
-            if sched_arr:
-                sched[stop["stop_id"]] = datetime.fromisoformat(sched_arr)
-        _schedules[row["trip_id"]] = sched
-    log.info(f"Warmed {len(_schedules)} active schedules from Supabase")
-
 
 def snapshot_schedule(db: Client, trip: Trip) -> None:
     """
-    Build the schedule baseline for a trip on first observation.
-    Lazily fetches scheduled times from stop_times (static GTFS).
-    Falls back to RT prediction for any stop not found in static data.
+    Capture the full route as the schedule baseline.
+    Only called when trip.underway is False — at that point stop_time_updates
+    contains every stop on the route, so i + 1 is the correct sequence.
     """
-    static = _fetch_schedule_from_static(db, trip.trip_id, trip.start_date)
-    if static:
-        log.debug(f"Static schedule for {trip.trip_id} ({len(static)} stops)")
-    else:
-        log.warning(f"No static match for {trip.trip_id}, using RT predictions as baseline")
-
     stops: list[dict[str, Any]] = []
-    sched: dict[str, datetime] = {}
+    sched: dict[str, tuple[datetime, int]] = {}
     for i, stu in enumerate(trip.stop_time_updates):
-        t: datetime | None = static.get(stu.stop_id) or stu.arrival or stu.departure
+        t: datetime | None = stu.arrival or stu.departure
+        seq: int = i + 1
         stops.append({
             "stop_id":   stu.stop_id,
-            "seq":       i + 1,
+            "seq":       seq,
             "stop_name": stu.stop_name,
             "sched_arr": t.isoformat() if t else None,
         })
         if t:
-            sched[stu.stop_id] = t
+            sched[stu.stop_id] = (t, seq)
 
     if not stops:
         return
 
-    db.table("trip_schedules").insert({
+    # Set in-memory cache before the DB write so a write failure
+    # doesn't cause an infinite retry loop on the next poll.
+    _schedules[trip.trip_id] = sched
+
+    db.table("trip_schedules").upsert({
         "trip_id":    trip.trip_id,
         "start_date": trip.start_date.isoformat(),
         "route_id":   trip.route_id,
         "direction":  trip.direction,
         "shape_id":   trip.shape_id,
         "stops":      stops,
-    }).execute()
+    }, ignore_duplicates=True).execute()
 
-    _schedules[trip.trip_id] = sched
-    log.debug(f"Snapshotted schedule for {trip.trip_id} ({len(stops)} stops)")
+    log.debug(f"Snapshotted {trip.trip_id} ({len(stops)} stops)")
 
 
 def record_stop_visit(
@@ -135,10 +83,11 @@ def record_stop_visit(
     stop_id: str,
     predicted_arrival: datetime | None,
     stop_name: str | None,
-    stop_sequence: int,
 ) -> None:
     """Write a completed stop visit. delay_seconds = actual - scheduled."""
-    scheduled: datetime | None = _schedules.get(trip.trip_id, {}).get(stop_id)
+    entry: tuple[datetime, int] | None = _schedules.get(trip.trip_id, {}).get(stop_id)
+    scheduled: datetime | None = entry[0] if entry else None
+    stop_sequence: int | None = entry[1] if entry else None
 
     delay_seconds: int | None = None
     if scheduled and predicted_arrival:
@@ -160,42 +109,39 @@ def record_stop_visit(
 
     log.debug(
         f"{trip.route_id} {trip.direction} | {stop_name or stop_id} | "
-        f"delay={delay_seconds}s"
+        f"seq={stop_sequence} delay={delay_seconds}s"
     )
 
 
 # ── poll ──────────────────────────────────────────────────────────────────────
 
-def poll(db: Client, feed: NYCTFeed) -> None:
-    feed.refresh()
-
-    # train_assigned=True catches trips ~30 min before departure for clean snapshots,
-    # as well as all currently running trains.
-    all_trips: list[Trip] = feed.filter_trips(line_id=FEED_LINE, train_assigned=True)
+def poll(db: Client, feeds: list[NYCTFeed]) -> None:
+    all_trips: list[Trip] = []
+    for feed in feeds:
+        feed.refresh()
+        all_trips.extend(feed.filter_trips(train_assigned=True))
     active_ids: set[str] = {t.trip_id for t in all_trips}
 
     for trip in all_trips:
         trip_id: str = trip.trip_id
 
-        # First time we've seen this trip — capture schedule baseline
         if trip_id not in _schedules:
             snapshot_schedule(db, trip)
 
-        # Departure detection only makes sense once the train is moving
         if not trip.underway:
             continue
 
         # Build current predictions for remaining stops
-        current: dict[str, tuple[datetime | None, str | None, int]] = {
-            stu.stop_id: (stu.arrival or stu.departure, stu.stop_name, i + 1)
-            for i, stu in enumerate(trip.stop_time_updates)
+        current: dict[str, tuple[datetime | None, str | None]] = {
+            stu.stop_id: (stu.arrival or stu.departure, stu.stop_name)
+            for stu in trip.stop_time_updates
         }
 
         # Any stop in last poll but not this one → train just departed it
         if trip_id in _last_predictions:
-            for stop_id, (pred_arr, stop_name, seq) in _last_predictions[trip_id].items():
+            for stop_id, (pred_arr, stop_name) in _last_predictions[trip_id].items():
                 if stop_id not in current:
-                    record_stop_visit(db, trip, stop_id, pred_arr, stop_name, seq)
+                    record_stop_visit(db, trip, stop_id, pred_arr, stop_name)
 
         _last_predictions[trip_id] = current
 
@@ -212,26 +158,33 @@ def poll(db: Client, feed: NYCTFeed) -> None:
               .execute()
             del _schedules[trip_id]
 
-    log.info(f"Active trips: {len(active_ids)} | Tracking: {len(_last_predictions)}")
+    pre_dep: int = sum(1 for t in all_trips if t.trip_id in _schedules and not t.underway)
+    skipped: int = sum(1 for t in all_trips if t.trip_id not in _schedules and t.underway)
+    log.warning(
+        f"Active: {len(active_ids)} | "
+        f"Pre-departure: {pre_dep} | "
+        f"Tracking: {len(_last_predictions)} | "
+        f"Skipped (joined mid-trip): {skipped}"
+    )
 
 
 # ── entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.WARNING,
         format="%(asctime)s  %(levelname)s  %(message)s",
         datefmt="%H:%M:%S",
     )
 
-    db: Client = get_client()
-    feed: NYCTFeed = NYCTFeed(FEED_LINE, fetch_immediately=False)
+    FEED_LINES: list[str] = ["1", "N"]
 
-    load_active_schedules(db)
+    db: Client = get_client()
+    feeds: list[NYCTFeed] = [NYCTFeed(line, fetch_immediately=False) for line in FEED_LINES]
 
     while True:
         try:
-            poll(db, feed)
+            poll(db, feeds)
         except Exception:
             log.exception("Poll failed")
         time.sleep(POLL_INTERVAL)

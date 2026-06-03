@@ -1,0 +1,212 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  height: 100%;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: #1a1a2e;
+  color: #f0f0f0;
+  overflow: hidden;
+}
+
+/* ── Map ─────────────────────────────────────────────────────────────────── */
+#map {
+  position: absolute;
+  inset: 0;
+}
+
+/* ── Line filter bar ─────────────────────────────────────────────────────── */
+#line-filter {
+  position: absolute;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: center;
+  padding: 10px 14px;
+  background: rgba(15, 15, 30, 0.88);
+  border-radius: 40px;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  max-width: 90vw;
+  z-index: 10;
+  box-shadow: 0 4px 24px rgba(0,0,0,0.5);
+}
+
+.route-btn {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: opacity 0.15s, transform 0.1s, border-color 0.15s;
+  user-select: none;
+}
+.route-btn:hover { transform: scale(1.15); }
+.route-btn.inactive { opacity: 0.25; }
+
+/* ── Info panel ──────────────────────────────────────────────────────────── */
+#info-panel {
+  position: absolute;
+  top: 16px;
+  right: -360px;
+  width: 320px;
+  max-height: calc(100vh - 32px);
+  background: rgba(15, 15, 30, 0.95);
+  border-radius: 12px;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  box-shadow: -4px 0 32px rgba(0,0,0,0.5);
+  transition: right 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  z-index: 20;
+}
+#info-panel.open { right: 16px; }
+
+#info-close {
+  position: absolute;
+  top: 10px;
+  right: 12px;
+  background: none;
+  border: none;
+  color: #888;
+  font-size: 16px;
+  cursor: pointer;
+  z-index: 1;
+  line-height: 1;
+}
+#info-close:hover { color: #fff; }
+
+#info-content {
+  padding: 16px;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.info-title {
+  font-size: 15px;
+  font-weight: 700;
+  margin-bottom: 4px;
+  padding-right: 24px;
+}
+.info-subtitle {
+  font-size: 12px;
+  color: #888;
+  margin-bottom: 14px;
+}
+
+.arrival-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 0;
+  border-bottom: 1px solid rgba(255,255,255,0.07);
+}
+.arrival-row:last-child { border-bottom: none; }
+
+.route-bullet {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 800;
+  flex-shrink: 0;
+}
+
+.arrival-info { flex: 1; min-width: 0; }
+.arrival-headsign {
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.arrival-detail { font-size: 11px; color: #888; margin-top: 2px; }
+
+.arrival-time {
+  font-size: 13px;
+  font-weight: 700;
+  text-align: right;
+  flex-shrink: 0;
+}
+.arrival-time.due { color: #4ade80; }
+.arrival-time.soon { color: #facc15; }
+
+.delay-badge {
+  display: inline-block;
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-weight: 600;
+  background: rgba(239,68,68,0.2);
+  color: #f87171;
+  margin-left: 4px;
+}
+.delay-badge.early {
+  background: rgba(74,222,128,0.2);
+  color: #4ade80;
+}
+
+.info-section-header {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #555;
+  margin: 12px 0 6px;
+}
+
+.no-arrivals {
+  font-size: 13px;
+  color: #555;
+  text-align: center;
+  padding: 20px 0;
+}
+
+/* ── Loading overlay ─────────────────────────────────────────────────────── */
+#loading {
+  position: absolute;
+  inset: 0;
+  background: #1a1a2e;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  font-size: 14px;
+  color: #888;
+  z-index: 100;
+  transition: opacity 0.5s;
+}
+#loading.hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.spinner {
+  width: 36px;
+  height: 36px;
+  border: 3px solid rgba(255,255,255,0.1);
+  border-top-color: #60a5fa;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ── MapLibre overrides ───────────────────────────────────────────────────── */
+.maplibregl-ctrl-attrib {
+  background: rgba(15,15,30,0.7) !important;
+  color: #555 !important;
+}
+.maplibregl-ctrl-attrib a { color: #555 !important; }

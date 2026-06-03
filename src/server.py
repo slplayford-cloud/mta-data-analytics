@@ -13,7 +13,7 @@ import os
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Callable
+from typing import cast
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,7 +31,6 @@ from supabase import create_client, Client
 
 from src.cache import StaticDataCache
 from src.poller import Poller
-from src import ingestion
 
 # ── Singletons ────────────────────────────────────────────────────────────────
 
@@ -90,10 +89,25 @@ class WebSocketManager:
         asyncio.run_coroutine_threadsafe(self.broadcast(payload, trains), loop)
 
 
+# ── Singleton accessors ────────────────────────────────────────────────────────
+# The globals above are populated in lifespan() before any request is served, but
+# the type checker can't prove that. These accessors narrow `X | None` → `X` (and
+# fail loudly if ever called before startup) so endpoints stay type-clean.
+
+def cache() -> StaticDataCache:
+    assert _cache is not None, "StaticDataCache accessed before startup"
+    return _cache
+
+
+def ws() -> "WebSocketManager":
+    assert _ws_manager is not None, "WebSocketManager accessed before startup"
+    return _ws_manager
+
+
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(_app: FastAPI):
     global _cache, _db, _poller, _ws_manager, _stop_info_bytes
 
     _db = create_client(
@@ -101,11 +115,6 @@ async def lifespan(app: FastAPI):
         os.environ["SUPABASE_SERVICE_KEY"],
     )
 
-    if hasattr(ingestion, "load_active_schedules"):
-        try:
-            ingestion.load_active_schedules(_db)
-        except Exception as e:
-            print(f"[server] schedule warm-up skipped: {e}")
 
     _cache = StaticDataCache()
     _cache.build()
@@ -125,7 +134,9 @@ async def lifespan(app: FastAPI):
                 .range(offset, offset + _PAGE - 1)
                 .execute()
             )
-            for row in page.data:
+            # postgrest types .data as a loose JSON value; we know each row is a dict
+            rows = cast(list[dict], page.data)
+            for row in rows:
                 _stop_info_map[row["stop_id"]] = {
                     "name":   row["stop_name"],
                     "lat":    row["stop_lat"],
@@ -133,7 +144,7 @@ async def lifespan(app: FastAPI):
                     "type":   row["location_type"],
                     "parent": row["parent_station"],
                 }
-            if len(page.data) < _PAGE:
+            if len(rows) < _PAGE:
                 break
             offset += _PAGE
         _stop_info_bytes = orjson.dumps(_stop_info_map)
@@ -147,7 +158,7 @@ async def lifespan(app: FastAPI):
     loop = asyncio.get_running_loop()
     _poller = Poller(
         _db,
-        ws_broadcast=lambda p, rows: _ws_manager.schedule_broadcast(p, rows, loop),
+        ws_broadcast=lambda p, rows: ws().schedule_broadcast(p, rows, loop),
     )
     t = threading.Thread(target=_poller.run, daemon=True, name="gtfs-poller")
     t.start()
@@ -169,7 +180,7 @@ router = APIRouter(prefix="/api")
 @router.get("/stations")
 async def get_stations() -> Response:
     return Response(
-        content=_cache.stations_geojson,
+        content=cache().stations_geojson,
         media_type="application/json",
         headers={"Cache-Control": _STATIC_CACHE},
     )
@@ -178,7 +189,7 @@ async def get_stations() -> Response:
 @router.get("/routes")
 async def get_routes() -> Response:
     return Response(
-        content=orjson.dumps(_cache.routes_meta),
+        content=orjson.dumps(cache().routes_meta),
         media_type="application/json",
         headers={"Cache-Control": _STATIC_CACHE},
     )
@@ -186,7 +197,7 @@ async def get_routes() -> Response:
 
 @router.get("/shapes/{route_id}")
 async def get_shapes(route_id: str) -> Response:
-    data = _cache.get_shapes_geojson(route_id)
+    data = cache().get_shapes_geojson(route_id)
     if data is None:
         raise HTTPException(status_code=404, detail=f"No shapes for route {route_id!r}")
     return Response(
@@ -200,7 +211,7 @@ async def get_shapes(route_id: str) -> Response:
 async def get_all_shapes() -> Response:
     """All route shapes in one request — eliminates 28 separate fetches at page load."""
     return Response(
-        content=_cache.all_shapes_bytes,
+        content=cache().all_shapes_bytes,
         media_type="application/json",
         headers={"Cache-Control": _STATIC_CACHE},
     )
@@ -209,7 +220,7 @@ async def get_all_shapes() -> Response:
 @router.get("/shape-index")
 async def get_shape_index() -> Response:
     return Response(
-        content=_cache.shape_index_bytes,
+        content=cache().shape_index_bytes,
         media_type="application/json",
         headers={"Cache-Control": _STATIC_CACHE},
     )
@@ -272,14 +283,15 @@ async def get_train_detail(trip_id: str) -> Response:
 
 @router.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    await _ws_manager.connect(websocket)
+    manager = ws()
+    await manager.connect(websocket)
     try:
         while True:
             await websocket.receive_bytes()
     except WebSocketDisconnect:
-        _ws_manager.disconnect(websocket)
+        manager.disconnect(websocket)
     except Exception:
-        _ws_manager.disconnect(websocket)
+        manager.disconnect(websocket)
 
 
 # ── Mount ──────────────────────────────────────────────────────────────────────

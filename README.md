@@ -45,7 +45,7 @@ MTA GTFS-RT feeds (8 divisions)
 
 Delays are computed without static GTFS data. When a trip first appears in the feed the current RT predictions are snapshotted as the schedule baseline. On each subsequent poll, stops that disappear from the remaining-stops list indicate a departure; the last predicted arrival time before disappearance is written as the actual arrival, and delay is the difference from the snapshotted baseline.
 
-## Stack
+## Tech Stack
 
 | Layer | Technology |
 |---|---|

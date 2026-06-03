@@ -2,6 +2,7 @@ anyio==4.13.0
 certifi==2026.4.22
 charset-normalizer==3.4.7
 duckdb==1.5.2
+fastapi==0.115.12
 h11==0.16.0
 httpcore==1.0.9
 httpx==0.28.1
@@ -9,7 +10,9 @@ idna==3.14
 -e git+ssh://git@github.com/slplayford-cloud/mta-data-analytics.git@deaa4366c96e582c3e6b7dc43f3aeb4dd93a207c#egg=mta_data_analytics
 networkx==3.6.1
 nyct-gtfs==2.1.0
+orjson==3.10.18
 protobuf==4.25.3
 requests==2.34.0
 typing_extensions==4.15.0
 urllib3==2.7.0
+uvicorn[standard]==0.34.2

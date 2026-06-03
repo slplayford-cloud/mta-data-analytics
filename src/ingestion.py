@@ -1,173 +1,194 @@
 #!/usr/bin/env python3
 """
-Collects data from MTA realtime feed and persists observations to DuckDB.
-Run from project root: python src/ingestion.py
+MTA real-time ingestion — tracks expected vs actual arrivals per station.
+Only tracks trips from their origin. Mid-trip trains are ignored.
+
+Run: python -m src.ingestion
 """
 
-import logging
-import signal
+import os
 import time
-from datetime import date, datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
+import logging
+from datetime import datetime
+from typing import Any
 
+from supabase import create_client, Client
 from nyct_gtfs import NYCTFeed
+from nyct_gtfs.trip import Trip
 
-from src.db import get_connection, get_scheduled_arrival, initialize, write_observation
-from src.graph import SubwayGraph
-from src.models import Train
+log = logging.getLogger(__name__)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+POLL_INTERVAL = 30  # seconds
 
-FEED_GROUPS = ("1", "A", "B", "G", "J", "N", "L", "SI")
-_NYC_TZ = ZoneInfo("America/New_York")
+# ── in-memory state ───────────────────────────────────────────────────────────
+
+# trip_id → {stop_id → (scheduled_arrival, stop_sequence)}
+# Only populated for trips captured before departure — i + 1 is accurate
+# when stop_time_updates contains the full route (train not yet underway).
+_schedules: dict[str, dict[str, tuple[datetime, int]]] = {}
+
+# trip_id → {stop_id → (predicted_arrival, stop_name)}
+# Rebuilt every poll. A stop disappearing = train departed that stop.
+_last_predictions: dict[str, dict[str, tuple[datetime | None, str | None]]] = {}
+
+# ── supabase ──────────────────────────────────────────────────────────────────
+
+def get_client() -> Client:
+    return create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
 
 
-def _derive_service_date(dt: datetime) -> date:
-    local = dt.astimezone(_NYC_TZ)
-    if local.hour < 3:
-        return (local - timedelta(days=1)).date()
-    return local.date()
+
+def snapshot_schedule(db: Client, trip: Trip) -> None:
+    """
+    Capture the full route as the schedule baseline.
+    Only called when trip.underway is False — at that point stop_time_updates
+    contains every stop on the route, so i + 1 is the correct sequence.
+    """
+    stops: list[dict[str, Any]] = []
+    sched: dict[str, tuple[datetime, int]] = {}
+    for i, stu in enumerate(trip.stop_time_updates):
+        t: datetime | None = stu.arrival or stu.departure
+        seq: int = i + 1
+        stops.append({
+            "stop_id":   stu.stop_id,
+            "seq":       seq,
+            "stop_name": stu.stop_name,
+            "sched_arr": t.isoformat() if t else None,
+        })
+        if t:
+            sched[stu.stop_id] = (t, seq)
+
+    if not stops:
+        return
+
+    # Set in-memory cache before the DB write so a write failure
+    # doesn't cause an infinite retry loop on the next poll.
+    _schedules[trip.trip_id] = sched
+
+    db.table("trip_schedules").upsert({
+        "trip_id":    trip.trip_id,
+        "start_date": trip.start_date.isoformat(),
+        "route_id":   trip.route_id,
+        "direction":  trip.direction,
+        "shape_id":   trip.shape_id,
+        "stops":      stops,
+    }, ignore_duplicates=True).execute()
+
+    log.debug(f"Snapshotted {trip.trip_id} ({len(stops)} stops)")
 
 
-def parse_train(trip, observed_at: datetime) -> Train:
-    location = trip.location
-    return Train(
-        trip_id=trip.trip_id,
-        route_id=trip.route_id,
-        direction=trip.direction,
-        headsign=getattr(trip, "headsign_text", None),
-        location_stop_id=location,
-        location_parent_station=location[:-1] if location else None,
-        location_status=trip.location_status if trip.location_status else None,
-        last_position_update=trip.last_position_update,
-        has_delay_alert=False,
-        observed_at=observed_at,
-        delay_seconds=None,
+def record_stop_visit(
+    db: Client,
+    trip: Trip,
+    stop_id: str,
+    predicted_arrival: datetime | None,
+    stop_name: str | None,
+) -> None:
+    """Write a completed stop visit. delay_seconds = actual - scheduled."""
+    entry: tuple[datetime, int] | None = _schedules.get(trip.trip_id, {}).get(stop_id)
+    scheduled: datetime | None = entry[0] if entry else None
+    stop_sequence: int | None = entry[1] if entry else None
+
+    delay_seconds: int | None = None
+    if scheduled and predicted_arrival:
+        delay_seconds = int((predicted_arrival - scheduled).total_seconds())
+
+    db.table("stop_visits").insert({
+        "trip_id":           trip.trip_id,
+        "start_date":        trip.start_date.isoformat(),
+        "route_id":          trip.route_id,
+        "direction":         trip.direction,
+        "stop_id":           stop_id,
+        "parent_station":    stop_id[:-1],  # strip N/S suffix
+        "stop_name":         stop_name,
+        "stop_sequence":     stop_sequence,
+        "scheduled_arrival": scheduled.isoformat() if scheduled else None,
+        "actual_arrival":    predicted_arrival.isoformat() if predicted_arrival else None,
+        "delay_seconds":     delay_seconds,
+    }).execute()
+
+    log.debug(
+        f"{trip.route_id} {trip.direction} | {stop_name or stop_id} | "
+        f"seq={stop_sequence} delay={delay_seconds}s"
     )
 
 
-def compute_delay(
-    conn,
-    train: Train,
-    stop_time_updates,
-    service_date: date,
-) -> int | None:
-    midnight = datetime(
-        service_date.year, service_date.month, service_date.day, tzinfo=_NYC_TZ
+# ── poll ──────────────────────────────────────────────────────────────────────
+
+def poll(db: Client, feeds: list[NYCTFeed]) -> None:
+    all_trips: list[Trip] = []
+    for feed in feeds:
+        feed.refresh()
+        all_trips.extend(feed.filter_trips(train_assigned=True))
+    active_ids: set[str] = {t.trip_id for t in all_trips}
+
+    for trip in all_trips:
+        trip_id: str = trip.trip_id
+
+        if trip_id not in _schedules:
+            snapshot_schedule(db, trip)
+
+        if not trip.underway:
+            continue
+
+        # Build current predictions for remaining stops
+        current: dict[str, tuple[datetime | None, str | None]] = {
+            stu.stop_id: (stu.arrival or stu.departure, stu.stop_name)
+            for stu in trip.stop_time_updates
+        }
+
+        # Any stop in last poll but not this one → train just departed it
+        if trip_id in _last_predictions:
+            for stop_id, (pred_arr, stop_name) in _last_predictions[trip_id].items():
+                if stop_id not in current:
+                    record_stop_visit(db, trip, stop_id, pred_arr, stop_name)
+
+        _last_predictions[trip_id] = current
+
+    # Clean up trips that have left the feed (completed or cancelled)
+    for trip_id in list(_last_predictions):
+        if trip_id not in active_ids:
+            del _last_predictions[trip_id]
+
+    for trip_id in list(_schedules):
+        if trip_id not in active_ids:
+            db.table("trip_schedules") \
+              .update({"is_active": False}) \
+              .eq("trip_id", trip_id) \
+              .execute()
+            del _schedules[trip_id]
+
+    pre_dep: int = sum(1 for t in all_trips if t.trip_id in _schedules and not t.underway)
+    skipped: int = sum(1 for t in all_trips if t.trip_id not in _schedules and t.underway)
+    log.warning(
+        f"Active: {len(active_ids)} | "
+        f"Pre-departure: {pre_dep} | "
+        f"Tracking: {len(_last_predictions)} | "
+        f"Skipped (joined mid-trip): {skipped}"
     )
-    for stu in stop_time_updates:
-        if stu.arrival is None:
-            continue
-        sched = get_scheduled_arrival(conn, train.trip_id, stu.stop_id, service_date)
-        if sched is None:
-            continue
-        predicted_s = int((stu.arrival.astimezone(_NYC_TZ) - midnight).total_seconds())
-        return predicted_s - sched
-    return None
 
 
-class Poller:
-    def __init__(
-        self,
-        conn,
-        graph: SubwayGraph,
-        interval_seconds: int = 30,
-    ) -> None:
-        self._conn = conn
-        self._graph = graph
-        self._interval = interval_seconds
-        self._running = False
+# ── entry point ───────────────────────────────────────────────────────────────
 
-    def run(self) -> None:
-        self._running = True
-        while self._running:
-            start = time.monotonic()
-            try:
-                self._poll_once()
-            except Exception as exc:
-                logging.error("poll cycle failed: %s", exc)
-            elapsed = time.monotonic() - start
-            remaining = self._interval - elapsed
-            if remaining > 0 and self._running:
-                time.sleep(remaining)
+def main() -> None:
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(asctime)s  %(levelname)s  %(message)s",
+        datefmt="%H:%M:%S",
+    )
 
-    def stop(self) -> None:
-        self._running = False
+    FEED_LINES: list[str] = ["1", "N"]
 
-    def _poll_once(self) -> None:
-        observed_at = datetime.now(tz=timezone.utc)
-        service_date = _derive_service_date(observed_at)
-        trains: list[Train] = []
+    db: Client = get_client()
+    feeds: list[NYCTFeed] = [NYCTFeed(line, fetch_immediately=False) for line in FEED_LINES]
 
-        for feed_key in FEED_GROUPS:
-            try:
-                feed = NYCTFeed(feed_specifier=feed_key)
-                trips = feed.filter_trips(underway=True)
-            except Exception as exc:
-                logging.error("feed %s: %s", feed_key, exc)
-                continue
-
-            for trip in trips:
-                try:
-                    train = parse_train(trip, observed_at)
-                    midnight = datetime(
-                        service_date.year, service_date.month, service_date.day,
-                        tzinfo=_NYC_TZ,
-                    )
-
-                    # Only include stops with predicted arrivals. stu.arrival is a
-                    # naive local-time datetime (fromtimestamp); make it UTC-aware
-                    # before storing in TIMESTAMPTZ.
-                    # StopTimeUpdate exposes no stop_sequence, so seq is a 0-based
-                    # relative index within the remaining stops list.
-                    stop_preds: list[tuple[str, int, datetime | None, int | None]] = []
-                    for seq, stu in enumerate(trip.stop_time_updates):
-                        if stu.arrival is None:
-                            continue
-                        arr = stu.arrival.astimezone(timezone.utc)
-                        sched = get_scheduled_arrival(
-                            self._conn, train.trip_id, stu.stop_id, service_date
-                        )
-                        stop_preds.append((stu.stop_id, seq, arr, sched))
-
-                    # Derive delay from the first stop that has a matching schedule.
-                    train.delay_seconds = None
-                    for _, _, arr, sched in stop_preds:
-                        if sched is not None:
-                            predicted_s = int(
-                                (arr.astimezone(_NYC_TZ) - midnight).total_seconds()
-                            )
-                            train.delay_seconds = predicted_s - sched
-                            break
-
-                    write_observation(
-                        self._conn, train, service_date, stop_preds or None
-                    )
-                    trains.append(train)
-                except Exception as exc:
-                    logging.warning(
-                        "trip %s: %s", getattr(trip, "trip_id", "?"), exc
-                    )
-
-        self._graph.update_trains(trains)
-        logging.info(
-            "poll complete — %d trains (service_date %s)", len(trains), service_date
-        )
+    while True:
+        try:
+            poll(db, feeds)
+        except Exception:
+            log.exception("Poll failed")
+        time.sleep(POLL_INTERVAL)
 
 
 if __name__ == "__main__":
-    conn = get_connection("mta.duckdb")
-    initialize(conn, static_dir="static/")
-    graph = SubwayGraph(conn)
-    graph.build()
-    poller = Poller(conn, graph)
-
-    def _handle_signal(sig, frame):  # type: ignore[type-arg]
-        logging.info("shutting down (signal %d)…", sig)
-        poller.stop()
-
-    signal.signal(signal.SIGINT, _handle_signal)
-    signal.signal(signal.SIGTERM, _handle_signal)
-
-    poller.run()
-    conn.close()
+    main()

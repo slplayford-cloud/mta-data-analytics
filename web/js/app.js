@@ -50,13 +50,19 @@ class SubwayApp {
 
       // Platform-level stop coords: parent station + N/S platform variants
       const allStopCoords = new Map();
+      // stop_id → human-readable station name
+      const stopNameMap = new Map();
       for (const f of stationsGeoJSON.features) {
         const [lon, lat] = f.geometry.coordinates;
-        const id = f.properties.id;
+        const { id, name } = f.properties;
         allStopCoords.set(id,        [lon, lat]);
         allStopCoords.set(id + 'N',  [lon, lat]);
         allStopCoords.set(id + 'S',  [lon, lat]);
+        stopNameMap.set(id,       name);
+        stopNameMap.set(id + 'N', name);
+        stopNameMap.set(id + 'S', name);
       }
+      this._infoPanel.setStopNames(stopNameMap);
 
       // shape_id → [[lon,lat],...] for interpolation
       const shapeGeomMap = new Map();

@@ -16,6 +16,20 @@ export class InfoPanel {
     }
   }
 
+  setStopNames(stopNameMap) {
+    this._stopNames = stopNameMap;
+  }
+
+  _stopName(stopId) {
+    if (!stopId) return null;
+    if (this._stopNames) {
+      return this._stopNames.get(stopId)
+        || this._stopNames.get(stopId.replace(/[NS]$/, ''))
+        || null;
+    }
+    return null;
+  }
+
   // ── Public API ─────────────────────────────────────────────────────────────
 
   showStation(data) {
@@ -54,11 +68,12 @@ export class InfoPanel {
 
     if (train.next_arr) {
       const mins = this._minutesUntil(train.next_arr);
+      const nextStopName = this._stopName(train.next_stop) || train.next_stop || 'Unknown';
       html += `
         <div class="info-section-header">Next stop</div>
         <div class="arrival-row">
           <div class="arrival-info">
-            <div class="arrival-headsign">${this._esc(train.next_stop || 'Unknown')}</div>
+            <div class="arrival-headsign">${this._esc(nextStopName)}</div>
           </div>
           <div class="arrival-time ${mins <= 0 ? 'due' : mins <= 2 ? 'soon' : ''}">
             ${mins <= 0 ? 'Due' : mins === 1 ? '1 min' : `${mins} min`}

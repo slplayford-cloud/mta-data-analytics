@@ -19,6 +19,7 @@ from nyct_gtfs import NYCTFeed
 from nyct_gtfs.trip import Trip
 
 from src import ingestion
+from src.ingestion import _stu_time
 
 log = logging.getLogger(__name__)
 
@@ -103,7 +104,7 @@ class Poller:
                 if not trip.underway:
                     continue
                 current = {
-                    stu.stop_id: (stu.arrival or stu.departure, stu.stop_name)
+                    stu.stop_id: (_stu_time(stu.arrival) or _stu_time(stu.departure), stu.stop_name)
                     for stu in trip.stop_time_updates
                 }
                 if trip.trip_id in ingestion._last_predictions:
@@ -191,7 +192,7 @@ class Poller:
 
         if next_stu:
             next_stop = next_stu.stop_id
-            arr = next_stu.arrival or next_stu.departure
+            arr = _stu_time(next_stu.arrival) or _stu_time(next_stu.departure)
             if arr:
                 next_arr = arr.isoformat()
                 sched_entry = ingestion._schedules.get(trip.trip_id, {}).get(next_stop)

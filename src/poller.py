@@ -23,7 +23,7 @@ from src import ingestion
 log = logging.getLogger(__name__)
 
 FEED_GROUPS    = ["1", "A", "B", "G", "J", "N", "L", "SI"]
-POLL_INTERVAL  = 30.0
+POLL_INTERVAL  = 15.0  # MTA feeds refresh every 15-30s; polling at 15s gives fresher positions
 
 
 def _derive_service_date(now: datetime) -> date:
@@ -38,7 +38,7 @@ class Poller:
         self,
         db: Client,
         interval: float = POLL_INTERVAL,
-        ws_broadcast: Callable[[bytes], None] | None = None,
+        ws_broadcast: Callable[[bytes, list], None] | None = None,
     ) -> None:
         self._db          = db
         self._interval    = interval
@@ -143,7 +143,7 @@ class Poller:
                 "trains": rows,
             })
             try:
-                self._ws_broadcast(payload)
+                self._ws_broadcast(payload, rows)
             except Exception:
                 log.warning("WS broadcast failed", exc_info=True)
 

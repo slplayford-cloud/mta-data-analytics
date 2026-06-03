@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
 """
 FastAPI server — serves pre-built static GeoJSON from the StaticDataCache,
-streams live train positions over WebSocket, and proxies Supabase queries
-for station arrival data.
+streams live train positions over WebSocket, and answers station arrival
+queries from in-memory state (no Supabase round-trip per click).
 
-Run:  uvicorn src.server:app --host 0.0.0.0 --port 8000
-  or: python run_server.py
-
-Required env vars:
-  SUPABASE_URL         — Supabase project URL
-  SUPABASE_SERVICE_KEY — service-role key (server-side only)
+Run:  python run_server.py
 """
 
 import asyncio
@@ -18,7 +13,7 @@ import os
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Callable, Awaitable
+from typing import Callable
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,6 +26,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.routing import APIRouter
+from starlette.middleware.gzip import GZipMiddleware
 from supabase import create_client, Client
 
 from src.cache import StaticDataCache
@@ -44,6 +40,11 @@ _db: Client | None = None
 _poller: Poller | None = None
 _ws_manager: "WebSocketManager | None" = None
 
+# 1-hour cache header for immutable static GTFS data
+_STATIC_CACHE = "public, max-age=3600, immutable"
+# No cache for live data
+_NO_CACHE = "no-cache, no-store"
+
 
 # ── WebSocket manager ─────────────────────────────────────────────────────────
 
@@ -52,12 +53,12 @@ class WebSocketManager:
 
     def __init__(self) -> None:
         self._connections: set[WebSocket] = set()
-        self._last_payload: bytes | None = None  # send to new clients immediately
+        self._last_payload: bytes | None = None
+        self._last_trains: list[dict] = []  # in-memory snapshot for arrivals queries
 
     async def connect(self, ws: WebSocket) -> None:
         await ws.accept()
         self._connections.add(ws)
-        # Send last known state immediately so client doesn't wait 30s
         if self._last_payload:
             try:
                 await ws.send_bytes(self._last_payload)
@@ -67,8 +68,13 @@ class WebSocketManager:
     def disconnect(self, ws: WebSocket) -> None:
         self._connections.discard(ws)
 
-    async def broadcast(self, payload: bytes) -> None:
+    @property
+    def last_trains(self) -> list[dict]:
+        return self._last_trains
+
+    async def broadcast(self, payload: bytes, trains: list[dict]) -> None:
         self._last_payload = payload
+        self._last_trains = trains
         dead: list[WebSocket] = []
         for ws in list(self._connections):
             try:
@@ -78,9 +84,8 @@ class WebSocketManager:
         for ws in dead:
             self._connections.discard(ws)
 
-    def schedule_broadcast(self, payload: bytes, loop: asyncio.AbstractEventLoop) -> None:
-        """Thread-safe: called from the Poller background thread."""
-        asyncio.run_coroutine_threadsafe(self.broadcast(payload), loop)
+    def schedule_broadcast(self, payload: bytes, trains: list[dict], loop: asyncio.AbstractEventLoop) -> None:
+        asyncio.run_coroutine_threadsafe(self.broadcast(payload, trains), loop)
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
@@ -94,23 +99,22 @@ async def lifespan(app: FastAPI):
         os.environ["SUPABASE_SERVICE_KEY"],
     )
 
-    # Warm in-memory schedule state (if the ingestion module supports it)
     if hasattr(ingestion, "load_active_schedules"):
         try:
             ingestion.load_active_schedules(_db)
         except Exception as e:
             print(f"[server] schedule warm-up skipped: {e}")
 
-    # Build static data cache from GTFS files
     _cache = StaticDataCache()
     _cache.build()
 
-    # WebSocket manager
     _ws_manager = WebSocketManager()
 
-    # Poller with broadcast wiring (get_running_loop() works correctly in async context)
     loop = asyncio.get_running_loop()
-    _poller = Poller(_db, ws_broadcast=lambda p: _ws_manager.schedule_broadcast(p, loop))
+    _poller = Poller(
+        _db,
+        ws_broadcast=lambda p, rows: _ws_manager.schedule_broadcast(p, rows, loop),
+    )
     t = threading.Thread(target=_poller.run, daemon=True, name="gtfs-poller")
     t.start()
 
@@ -122,6 +126,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan, title="MTA Subway Map API")
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 router = APIRouter(prefix="/api")
 
 
@@ -129,13 +134,20 @@ router = APIRouter(prefix="/api")
 
 @router.get("/stations")
 async def get_stations() -> Response:
-    """GeoJSON FeatureCollection of all parent stations."""
-    return Response(content=_cache.stations_geojson, media_type="application/json")
+    return Response(
+        content=_cache.stations_geojson,
+        media_type="application/json",
+        headers={"Cache-Control": _STATIC_CACHE},
+    )
 
 
 @router.get("/routes")
 async def get_routes() -> Response:
-    return Response(content=orjson.dumps(_cache.routes_meta), media_type="application/json")
+    return Response(
+        content=orjson.dumps(_cache.routes_meta),
+        media_type="application/json",
+        headers={"Cache-Control": _STATIC_CACHE},
+    )
 
 
 @router.get("/shapes/{route_id}")
@@ -143,53 +155,63 @@ async def get_shapes(route_id: str) -> Response:
     data = _cache.get_shapes_geojson(route_id)
     if data is None:
         raise HTTPException(status_code=404, detail=f"No shapes for route {route_id!r}")
-    return Response(content=data, media_type="application/json")
+    return Response(
+        content=data,
+        media_type="application/json",
+        headers={"Cache-Control": _STATIC_CACHE},
+    )
+
+
+@router.get("/all-shapes")
+async def get_all_shapes() -> Response:
+    """All route shapes in one request — eliminates 28 separate fetches at page load."""
+    return Response(
+        content=_cache.all_shapes_bytes,
+        media_type="application/json",
+        headers={"Cache-Control": _STATIC_CACHE},
+    )
 
 
 @router.get("/shape-index")
 async def get_shape_index() -> Response:
-    return Response(content=_cache.shape_index_bytes, media_type="application/json")
+    return Response(
+        content=_cache.shape_index_bytes,
+        media_type="application/json",
+        headers={"Cache-Control": _STATIC_CACHE},
+    )
 
 
 @router.get("/station/{station_id}/arrivals")
 async def get_station_arrivals(station_id: str) -> Response:
-    try:
-        resp = (
-            _db.table("current_trains")
-            .select("trip_id,route_id,direction,headsign,loc_stop_id,loc_station,status,next_stop,next_arr,delay_seconds")
-            .or_(f"loc_station.eq.{station_id},next_stop.like.{station_id}%")
-            .order("next_arr", nullsfirst=False)
-            .limit(12)
-            .execute()
-        )
-        return Response(
-            content=orjson.dumps({"station_id": station_id, "arrivals": resp.data or []}),
-            media_type="application/json",
-        )
-    except Exception as e:
-        return Response(
-            content=orjson.dumps({"station_id": station_id, "arrivals": [], "error": str(e)}),
-            media_type="application/json",
-        )
+    """
+    Answers from in-memory train state — no Supabase round-trip.
+    loc_station is parent station id; next_stop is platform-level (e.g. "110N").
+    """
+    trains = _ws_manager.last_trains if _ws_manager else []
+    arrivals = [
+        t for t in trains
+        if t.get("loc_station") == station_id
+        or (t.get("next_stop") or "").startswith(station_id)
+    ]
+    arrivals.sort(key=lambda t: t.get("next_arr") or "")
+    return Response(
+        content=orjson.dumps({"station_id": station_id, "arrivals": arrivals[:12]}),
+        media_type="application/json",
+        headers={"Cache-Control": _NO_CACHE},
+    )
 
 
 @router.get("/train/{trip_id}")
 async def get_train_detail(trip_id: str) -> Response:
-    try:
-        resp = (
-            _db.table("current_trains")
-            .select("*")
-            .eq("trip_id", trip_id)
-            .limit(1)
-            .execute()
-        )
-        if not resp.data:
-            raise HTTPException(status_code=404, detail="Train not found")
-        return Response(content=orjson.dumps(resp.data[0]), media_type="application/json")
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    trains = _ws_manager.last_trains if _ws_manager else []
+    match = next((t for t in trains if t.get("trip_id") == trip_id), None)
+    if not match:
+        raise HTTPException(status_code=404, detail="Train not found")
+    return Response(
+        content=orjson.dumps(match),
+        media_type="application/json",
+        headers={"Cache-Control": _NO_CACHE},
+    )
 
 
 # ── WebSocket ──────────────────────────────────────────────────────────────────
@@ -198,7 +220,6 @@ async def get_train_detail(trip_id: str) -> Response:
 async def websocket_endpoint(websocket: WebSocket):
     await _ws_manager.connect(websocket)
     try:
-        # Keep alive; client sends no messages in normal operation
         while True:
             await websocket.receive_bytes()
     except WebSocketDisconnect:

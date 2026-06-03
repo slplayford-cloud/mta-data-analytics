@@ -48,21 +48,29 @@ class SubwayApp {
 
       // ── Build lookup structures ───────────────────────────────────────────
 
-      // Platform-level stop coords: parent station + N/S platform variants
-      const allStopCoords = new Map();
-      // stop_id → human-readable station name
+      // stop_id → human-readable name (seeded immediately from GeoJSON, enriched
+      // below from stop_info). TrainManager derives its own coord lookup from the
+      // same GeoJSON and resolves platform ids (e.g. "L06N") to the parent stop
+      // by stripping the suffix, so no separate N/S coord map is needed here.
       const stopNameMap = new Map();
       for (const f of stationsGeoJSON.features) {
-        const [lon, lat] = f.geometry.coordinates;
         const { id, name } = f.properties;
-        allStopCoords.set(id,        [lon, lat]);
-        allStopCoords.set(id + 'N',  [lon, lat]);
-        allStopCoords.set(id + 'S',  [lon, lat]);
-        stopNameMap.set(id,       name);
-        stopNameMap.set(id + 'N', name);
-        stopNameMap.set(id + 'S', name);
+        if (name) stopNameMap.set(id, name);
       }
+      // Set names now so station clicks work immediately
       this._infoPanel.setStopNames(stopNameMap);
+
+      // Enrich with full stop_info table in the background — adds platform-level
+      // accuracy and any stops not in the parent-station GeoJSON
+      fetch('/api/stop-info')
+        .then(r => r.ok ? r.json() : null)
+        .then(info => {
+          if (!info) return;
+          for (const [id, s] of Object.entries(info)) {
+            if (s && s.name) stopNameMap.set(id, s.name);
+          }
+        })
+        .catch(() => {});
 
       // shape_id → [[lon,lat],...] for interpolation
       const shapeGeomMap = new Map();
@@ -110,7 +118,6 @@ class SubwayApp {
         shapeIdx,
         shapeGeomMap,
         stationsGeoJSON,
-        allStopCoords,
       );
       this._trainManager.init();
       this._trainManager.onTrainClick(train => this._infoPanel.showTrain(train));

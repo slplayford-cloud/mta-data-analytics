@@ -139,6 +139,8 @@ class TrainState {
       direction:     this.direction,
       status:        this.status,
       delay_seconds: this.delay,
+      loc_station:   this.locStation,
+      loc_stop_id:   this.locStopId,
       next_stop:     this.nextStop,
       next_arr:      this.nextArr,
     };
@@ -148,22 +150,19 @@ class TrainState {
 // ── TrainManager ───────────────────────────────────────────────────────────
 
 export class TrainManager {
-  constructor(mapManager, routesMeta, shapeIdx, shapeGeomMap, stationsGeoJSON, allStopCoords) {
+  constructor(mapManager, routesMeta, shapeIdx, shapeGeomMap, stationsGeoJSON) {
     this._leaflet     = mapManager.leaflet;
     this._shapeIdx    = shapeIdx;
     this._shapeGeom   = shapeGeomMap;
     this._routeColors = new Map(routesMeta.map(r => [r.route_id, r.color]));
     this._visibleRoutes = new Set(routesMeta.map(r => r.route_id));
 
+    // Parent-station coords keyed by stop_id. Platform ids ("L06N") resolve to
+    // the parent via suffix-stripping in _stationCoords(), so only parents are stored.
     this._stopCoords = new Map();
     for (const f of stationsGeoJSON.features) {
       const [lon, lat] = f.geometry.coordinates;
       this._stopCoords.set(f.properties.id, [lon, lat]);
-    }
-    if (allStopCoords) {
-      for (const [id, coords] of allStopCoords) {
-        if (!this._stopCoords.has(id)) this._stopCoords.set(id, coords);
-      }
     }
 
     this._shapePrefix = new Map();

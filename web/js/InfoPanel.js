@@ -35,8 +35,10 @@ export class InfoPanel {
   showStation(data) {
     const { station_id, arrivals } = data;
 
-    // Find station name from first arrival or use id
-    const name = arrivals[0]?.station_name || `Station ${station_id}`;
+    // Resolve station name: server response → client-side lookup → raw id
+    const name = data.station_name
+      || this._stopName(station_id)
+      || `Station ${station_id}`;
 
     let html = `<div class="info-title">${this._esc(name)}</div>
                 <div class="info-subtitle">Upcoming arrivals</div>`;
@@ -54,7 +56,10 @@ export class InfoPanel {
   showTrain(train) {
     const meta = this._routeColors.get(train.route_id) || { color: '888888', textColor: 'FFFFFF' };
     const delayHtml = this._delayBadge(train.delay_seconds);
-    const statusStr = this._statusLabel(train.status);
+
+    // Resolve current location to a name
+    const locName = this._stopName(train.loc_stop_id) || this._stopName(train.loc_station);
+    const statusStr = this._statusLabel(train.status, locName);
 
     let html = `
       <div class="info-title" style="display:flex;align-items:center;gap:8px">
@@ -128,12 +133,13 @@ export class InfoPanel {
     }
   }
 
-  _statusLabel(status) {
-    if (!status) return '';
-    if (status === 'STOPPED_AT') return 'Stopped at station';
-    if (status === 'IN_TRANSIT_TO') return 'In transit';
-    if (status === 'INCOMING_AT') return 'Arriving';
-    return status;
+  _statusLabel(status, locationName) {
+    const loc = locationName ? ` · ${locationName}` : '';
+    if (!status) return locationName || '';
+    if (status === 'STOPPED_AT')   return `Stopped at${loc || ' station'}`;
+    if (status === 'IN_TRANSIT_TO') return `In transit${loc}`;
+    if (status === 'INCOMING_AT')  return `Arriving${loc}`;
+    return status + loc;
   }
 
   _minutesUntil(isoOrUnix) {

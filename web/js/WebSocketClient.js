@@ -3,6 +3,11 @@
  * Exponential backoff reconnect; calls onTrains() with the full train array
  * after every update.
  */
+
+// One decoder reused across all frames — constructing a TextDecoder per message
+// allocates needlessly on every broadcast.
+const _decoder = new TextDecoder();
+
 export class WebSocketClient {
   constructor(path = '/api/ws') {
     this._path    = path;
@@ -30,7 +35,7 @@ export class WebSocketClient {
 
     this._ws.onmessage = e => {
       try {
-        const msg = JSON.parse(new TextDecoder().decode(e.data));
+        const msg = JSON.parse(_decoder.decode(e.data));
         if (msg.type === 'trains') {
           // Full state snapshot — replace cache entirely
           this._cache.clear();

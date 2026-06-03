@@ -39,6 +39,8 @@ _cache: StaticDataCache | None = None
 _db: Client | None = None
 _poller: Poller | None = None
 _ws_manager: "WebSocketManager | None" = None
+_stop_info_bytes: bytes | None = None
+_stop_info_map: dict[str, dict] = {}  # stop_id → {name, lat, lon, ...}
 
 # 1-hour cache header for immutable static GTFS data
 _STATIC_CACHE = "public, max-age=3600, immutable"
@@ -92,7 +94,7 @@ class WebSocketManager:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _cache, _db, _poller, _ws_manager
+    global _cache, _db, _poller, _ws_manager, _stop_info_bytes
 
     _db = create_client(
         os.environ["SUPABASE_URL"],
@@ -107,6 +109,38 @@ async def lifespan(app: FastAPI):
 
     _cache = StaticDataCache()
     _cache.build()
+
+    # Load stop_info once at startup — static GTFS data, no per-request DB hit.
+    # PostgREST caps a single response at 1000 rows; stop_info has ~1488, so we
+    # page through with .range() until a short page signals the end. Without this
+    # everything alphabetically after "G20" (incl. all L-line stops) is dropped,
+    # which is what made station_name come back null for e.g. L06.
+    try:
+        _PAGE = 1000
+        offset = 0
+        while True:
+            page = (
+                _db.table("stop_info")
+                .select("stop_id,stop_name,stop_lat,stop_lon,location_type,parent_station")
+                .range(offset, offset + _PAGE - 1)
+                .execute()
+            )
+            for row in page.data:
+                _stop_info_map[row["stop_id"]] = {
+                    "name":   row["stop_name"],
+                    "lat":    row["stop_lat"],
+                    "lon":    row["stop_lon"],
+                    "type":   row["location_type"],
+                    "parent": row["parent_station"],
+                }
+            if len(page.data) < _PAGE:
+                break
+            offset += _PAGE
+        _stop_info_bytes = orjson.dumps(_stop_info_map)
+        logging.getLogger(__name__).info("stop_info loaded: %d stops", len(_stop_info_map))
+    except Exception as e:
+        logging.getLogger(__name__).warning("stop_info load failed: %s", e)
+        _stop_info_bytes = orjson.dumps({})
 
     _ws_manager = WebSocketManager()
 
@@ -181,6 +215,16 @@ async def get_shape_index() -> Response:
     )
 
 
+@router.get("/stop-info")
+async def get_stop_info() -> Response:
+    """All stops from Supabase stop_info table, keyed by stop_id. Cached 1h."""
+    return Response(
+        content=_stop_info_bytes,
+        media_type="application/json",
+        headers={"Cache-Control": _STATIC_CACHE},
+    )
+
+
 @router.get("/station/{station_id}/arrivals")
 async def get_station_arrivals(station_id: str) -> Response:
     """
@@ -194,8 +238,18 @@ async def get_station_arrivals(station_id: str) -> Response:
         or (t.get("next_stop") or "").startswith(station_id)
     ]
     arrivals.sort(key=lambda t: t.get("next_arr") or "")
+
+    # Resolve station name server-side so the client always gets it
+    station_name: str | None = None
+    if station_info := _stop_info_map.get(station_id):
+        station_name = station_info.get("name")
+
     return Response(
-        content=orjson.dumps({"station_id": station_id, "arrivals": arrivals[:12]}),
+        content=orjson.dumps({
+            "station_id":   station_id,
+            "station_name": station_name,
+            "arrivals":     arrivals[:12],
+        }),
         media_type="application/json",
         headers={"Cache-Control": _NO_CACHE},
     )
@@ -230,9 +284,26 @@ async def websocket_endpoint(websocket: WebSocket):
 
 # ── Mount ──────────────────────────────────────────────────────────────────────
 
+
+class NoCacheStaticFiles(StaticFiles):
+    """Serve web assets with `no-cache` so browsers always revalidate.
+
+    ES module imports (app.js → ./MapManager.js, …) are fetched directly by the
+    browser and would otherwise be cached aggressively, leaving users on stale
+    code after a deploy. `no-cache` forces a conditional request; unchanged files
+    still return a fast 304 (StaticFiles sends an ETag), so the cost is one
+    round-trip, not a full re-download.
+    """
+
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 app.include_router(router)
 app.mount(
     "/",
-    StaticFiles(directory=str(Path(__file__).parent.parent / "web"), html=True),
+    NoCacheStaticFiles(directory=str(Path(__file__).parent.parent / "web"), html=True),
     name="web",
 )

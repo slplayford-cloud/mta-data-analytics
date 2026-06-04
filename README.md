@@ -41,8 +41,6 @@ MTA GTFS-RT feeds (8 divisions)
 | `trip_schedules` | Full stop list + predicted arrival times, snapshotted when a trip is first seen. |
 | `stop_visits` | One row per stop departure — scheduled vs actual arrival and delay in seconds. |
 
-## Delay tracking
-
 Delays are computed without static GTFS data. When a trip first appears in the feed the current RT predictions are snapshotted as the schedule baseline. On each subsequent poll, stops that disappear from the remaining-stops list indicate a departure; the last predicted arrival time before disappearance is written as the actual arrival, and delay is the difference from the snapshotted baseline.
 
 ## Tech Stack

@@ -1,121 +1,36 @@
 /**
- * MapManager — wraps MapLibre GL JS. All other managers interact with the map
- * only through this class, never calling map.* directly.
+ * MapManager — wraps Leaflet.
  */
 export class MapManager {
   constructor(containerId) {
-    this._map = new maplibregl.Map({
-      container: containerId,
-      style: 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json',
-      center: [-73.985, 40.748],
+    this._map = L.map(containerId, {
+      center: [40.748, -73.985],
       zoom: 11,
       minZoom: 9,
       maxZoom: 18,
-      antialias: true,
+      maxBounds: L.latLngBounds([40.47, -74.42], [40.95, -73.62]),
+      maxBoundsViscosity: 1.0,
+      zoomSnap: 0.5,
+      // No preferCanvas — we control rendering per layer type
     });
-    this._loadPromise = new Promise(resolve => this._map.on('load', resolve));
-  }
 
-  waitForLoad() {
-    return this._loadPromise;
-  }
-
-  get map() {
-    return this._map;
-  }
-
-  // ── Sources ─────────────────────────────────────────────────────────────────
-
-  addGeoJSONSource(id, data) {
-    if (this._map.getSource(id)) return;
-    this._map.addSource(id, {
-      type: 'geojson',
-      data,
-      buffer: 0,
-      tolerance: 0.5,
-    });
-  }
-
-  updateGeoJSONSource(id, data) {
-    const src = this._map.getSource(id);
-    if (src) src.setData(data);
-  }
-
-  // ── Layers ──────────────────────────────────────────────────────────────────
-
-  addLineLayer(id, sourceId, colorExpr, widthExpr, beforeId) {
-    if (this._map.getLayer(id)) return;
-    this._map.addLayer({
-      id,
-      type: 'line',
-      source: sourceId,
-      layout: { 'line-join': 'round', 'line-cap': 'round' },
-      paint: {
-        'line-color': colorExpr,
-        'line-width': widthExpr,
-        'line-opacity': 0.85,
+    L.tileLayer(
+      'https://tiles.stadiamaps.com/tiles/alidade_smooth_dark/{z}/{x}/{y}@2x.png',
+      {
+        tileSize: 512,
+        zoomOffset: -1,
+        maxZoom: 20,
+        attribution:
+          '© <a href="https://www.stadiamaps.com/">Stadia Maps</a> ' +
+          '© <a href="https://openmaptiles.org/">OpenMapTiles</a> ' +
+          '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
       },
-    }, beforeId);
+    ).addTo(this._map);
+
+    // whenReady fires synchronously when center+zoom are set in constructor
+    this._loadPromise = new Promise(resolve => this._map.whenReady(resolve));
   }
 
-  addCircleLayer(id, sourceId, colorExpr, radiusExpr, beforeId) {
-    if (this._map.getLayer(id)) return;
-    this._map.addLayer({
-      id,
-      type: 'circle',
-      source: sourceId,
-      paint: {
-        'circle-color': colorExpr,
-        'circle-radius': radiusExpr,
-        'circle-stroke-width': 1.5,
-        'circle-stroke-color': '#ffffff',
-        'circle-stroke-opacity': 0.9,
-      },
-    }, beforeId);
-  }
-
-  addSymbolLayer(id, sourceId, textField, minZoom, beforeId) {
-    if (this._map.getLayer(id)) return;
-    this._map.addLayer({
-      id,
-      type: 'symbol',
-      source: sourceId,
-      minzoom: minZoom,
-      layout: {
-        'text-field': textField,
-        'text-size': 11,
-        'text-offset': [0, 1.5],
-        'text-anchor': 'top',
-        'text-font': ['Noto Sans Regular'],
-      },
-      paint: {
-        'text-color': '#ffffff',
-        'text-halo-color': '#000000',
-        'text-halo-width': 1.5,
-      },
-    }, beforeId);
-  }
-
-  // ── Visibility ──────────────────────────────────────────────────────────────
-
-  setLayerVisibility(layerId, visible) {
-    if (!this._map.getLayer(layerId)) return;
-    this._map.setLayoutProperty(layerId, 'visibility', visible ? 'visible' : 'none');
-  }
-
-  hasLayer(id) {
-    return !!this._map.getLayer(id);
-  }
-
-  // ── Events ──────────────────────────────────────────────────────────────────
-
-  onLayerClick(layerId, callback) {
-    this._map.on('click', layerId, callback);
-    this._map.on('mouseenter', layerId, () => {
-      this._map.getCanvas().style.cursor = 'pointer';
-    });
-    this._map.on('mouseleave', layerId, () => {
-      this._map.getCanvas().style.cursor = '';
-    });
-  }
+  waitForLoad() { return this._loadPromise; }
+  get leaflet()  { return this._map; }
 }

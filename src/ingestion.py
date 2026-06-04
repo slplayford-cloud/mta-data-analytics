@@ -20,6 +20,12 @@ log = logging.getLogger(__name__)
 
 POLL_INTERVAL = 30  # seconds
 
+_MIN_VALID_DT = datetime(2000, 1, 1)
+
+def _stu_time(t: datetime | None) -> datetime | None:
+    """Return t only if it's a real timestamp; nyct-gtfs returns epoch (1970) for unset fields."""
+    return t if (t is not None and t > _MIN_VALID_DT) else None
+
 # ── in-memory state ───────────────────────────────────────────────────────────
 
 # trip_id → {stop_id → (scheduled_arrival, stop_sequence)}
@@ -47,7 +53,7 @@ def snapshot_schedule(db: Client, trip: Trip) -> None:
     stops: list[dict[str, Any]] = []
     sched: dict[str, tuple[datetime, int]] = {}
     for i, stu in enumerate(trip.stop_time_updates):
-        t: datetime | None = stu.arrival or stu.departure
+        t: datetime | None = _stu_time(stu.arrival) or _stu_time(stu.departure)
         seq: int = i + 1
         stops.append({
             "stop_id":   stu.stop_id,
@@ -133,7 +139,7 @@ def poll(db: Client, feeds: list[NYCTFeed]) -> None:
 
         # Build current predictions for remaining stops
         current: dict[str, tuple[datetime | None, str | None]] = {
-            stu.stop_id: (stu.arrival or stu.departure, stu.stop_name)
+            stu.stop_id: (_stu_time(stu.arrival) or _stu_time(stu.departure), stu.stop_name)
             for stu in trip.stop_time_updates
         }
 

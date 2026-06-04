@@ -12,6 +12,7 @@ html, body {
 #map {
   position: absolute;
   inset: 0;
+  z-index: 0; /* creates stacking context — isolates internal z-indexes from UI overlays */
 }
 
 /* ── Line filter bar ─────────────────────────────────────────────────────── */
@@ -204,9 +205,17 @@ html, body {
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-/* ── MapLibre overrides ───────────────────────────────────────────────────── */
-.maplibregl-ctrl-attrib {
+/* ── Leaflet overrides ────────────────────────────────────────────────────── */
+.leaflet-container { background: #1a1a2e; }
+.leaflet-control-attribution {
   background: rgba(15,15,30,0.7) !important;
-  color: #555 !important;
+  color: #444 !important;
+  font-size: 10px !important;
 }
-.maplibregl-ctrl-attrib a { color: #555 !important; }
+.leaflet-control-attribution a { color: #666 !important; }
+.leaflet-control-zoom a {
+  background: rgba(15,15,30,0.88) !important;
+  color: #ccc !important;
+  border-color: rgba(255,255,255,0.1) !important;
+}
+.leaflet-control-zoom a:hover { background: rgba(40,40,70,0.95) !important; }

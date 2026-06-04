@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
 """
 FastAPI server — serves pre-built static GeoJSON from the StaticDataCache,
-streams live train positions over WebSocket, and proxies Supabase queries
-for station arrival data.
+streams live train positions over WebSocket, and answers station arrival
+queries from in-memory state (no Supabase round-trip per click).
 
-Run:  uvicorn src.server:app --host 0.0.0.0 --port 8000
-  or: python run_server.py
-
-Required env vars:
-  SUPABASE_URL         — Supabase project URL
-  SUPABASE_SERVICE_KEY — service-role key (server-side only)
+Run:  python run_server.py
 """
 
 import asyncio
@@ -18,7 +13,7 @@ import os
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Callable, Awaitable
+from typing import cast
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,11 +26,11 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.routing import APIRouter
+from starlette.middleware.gzip import GZipMiddleware
 from supabase import create_client, Client
 
 from src.cache import StaticDataCache
 from src.poller import Poller
-from src import ingestion
 
 # ── Singletons ────────────────────────────────────────────────────────────────
 
@@ -43,6 +38,13 @@ _cache: StaticDataCache | None = None
 _db: Client | None = None
 _poller: Poller | None = None
 _ws_manager: "WebSocketManager | None" = None
+_stop_info_bytes: bytes | None = None
+_stop_info_map: dict[str, dict] = {}  # stop_id → {name, lat, lon, ...}
+
+# 1-hour cache header for immutable static GTFS data
+_STATIC_CACHE = "public, max-age=3600, immutable"
+# No cache for live data
+_NO_CACHE = "no-cache, no-store"
 
 
 # ── WebSocket manager ─────────────────────────────────────────────────────────
@@ -52,12 +54,12 @@ class WebSocketManager:
 
     def __init__(self) -> None:
         self._connections: set[WebSocket] = set()
-        self._last_payload: bytes | None = None  # send to new clients immediately
+        self._last_payload: bytes | None = None
+        self._last_trains: list[dict] = []  # in-memory snapshot for arrivals queries
 
     async def connect(self, ws: WebSocket) -> None:
         await ws.accept()
         self._connections.add(ws)
-        # Send last known state immediately so client doesn't wait 30s
         if self._last_payload:
             try:
                 await ws.send_bytes(self._last_payload)
@@ -67,8 +69,13 @@ class WebSocketManager:
     def disconnect(self, ws: WebSocket) -> None:
         self._connections.discard(ws)
 
-    async def broadcast(self, payload: bytes) -> None:
+    @property
+    def last_trains(self) -> list[dict]:
+        return self._last_trains
+
+    async def broadcast(self, payload: bytes, trains: list[dict]) -> None:
         self._last_payload = payload
+        self._last_trains = trains
         dead: list[WebSocket] = []
         for ws in list(self._connections):
             try:
@@ -78,39 +85,81 @@ class WebSocketManager:
         for ws in dead:
             self._connections.discard(ws)
 
-    def schedule_broadcast(self, payload: bytes, loop: asyncio.AbstractEventLoop) -> None:
-        """Thread-safe: called from the Poller background thread."""
-        asyncio.run_coroutine_threadsafe(self.broadcast(payload), loop)
+    def schedule_broadcast(self, payload: bytes, trains: list[dict], loop: asyncio.AbstractEventLoop) -> None:
+        asyncio.run_coroutine_threadsafe(self.broadcast(payload, trains), loop)
+
+
+# ── Singleton accessors ────────────────────────────────────────────────────────
+# The globals above are populated in lifespan() before any request is served, but
+# the type checker can't prove that. These accessors narrow `X | None` → `X` (and
+# fail loudly if ever called before startup) so endpoints stay type-clean.
+
+def cache() -> StaticDataCache:
+    assert _cache is not None, "StaticDataCache accessed before startup"
+    return _cache
+
+
+def ws() -> "WebSocketManager":
+    assert _ws_manager is not None, "WebSocketManager accessed before startup"
+    return _ws_manager
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    global _cache, _db, _poller, _ws_manager
+async def lifespan(_app: FastAPI):
+    global _cache, _db, _poller, _ws_manager, _stop_info_bytes
 
     _db = create_client(
         os.environ["SUPABASE_URL"],
         os.environ["SUPABASE_SERVICE_KEY"],
     )
 
-    # Warm in-memory schedule state (if the ingestion module supports it)
-    if hasattr(ingestion, "load_active_schedules"):
-        try:
-            ingestion.load_active_schedules(_db)
-        except Exception as e:
-            print(f"[server] schedule warm-up skipped: {e}")
 
-    # Build static data cache from GTFS files
     _cache = StaticDataCache()
     _cache.build()
 
-    # WebSocket manager
+    # Load stop_info once at startup — static GTFS data, no per-request DB hit.
+    # PostgREST caps a single response at 1000 rows; stop_info has ~1488, so we
+    # page through with .range() until a short page signals the end. Without this
+    # everything alphabetically after "G20" (incl. all L-line stops) is dropped,
+    # which is what made station_name come back null for e.g. L06.
+    try:
+        _PAGE = 1000
+        offset = 0
+        while True:
+            page = (
+                _db.table("stop_info")
+                .select("stop_id,stop_name,stop_lat,stop_lon,location_type,parent_station")
+                .range(offset, offset + _PAGE - 1)
+                .execute()
+            )
+            # postgrest types .data as a loose JSON value; we know each row is a dict
+            rows = cast(list[dict], page.data)
+            for row in rows:
+                _stop_info_map[row["stop_id"]] = {
+                    "name":   row["stop_name"],
+                    "lat":    row["stop_lat"],
+                    "lon":    row["stop_lon"],
+                    "type":   row["location_type"],
+                    "parent": row["parent_station"],
+                }
+            if len(rows) < _PAGE:
+                break
+            offset += _PAGE
+        _stop_info_bytes = orjson.dumps(_stop_info_map)
+        logging.getLogger(__name__).info("stop_info loaded: %d stops", len(_stop_info_map))
+    except Exception as e:
+        logging.getLogger(__name__).warning("stop_info load failed: %s", e)
+        _stop_info_bytes = orjson.dumps({})
+
     _ws_manager = WebSocketManager()
 
-    # Poller with broadcast wiring (get_running_loop() works correctly in async context)
     loop = asyncio.get_running_loop()
-    _poller = Poller(_db, ws_broadcast=lambda p: _ws_manager.schedule_broadcast(p, loop))
+    _poller = Poller(
+        _db,
+        ws_broadcast=lambda p, rows: ws().schedule_broadcast(p, rows, loop),
+    )
     t = threading.Thread(target=_poller.run, daemon=True, name="gtfs-poller")
     t.start()
 
@@ -122,6 +171,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan, title="MTA Subway Map API")
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 router = APIRouter(prefix="/api")
 
 
@@ -129,89 +179,143 @@ router = APIRouter(prefix="/api")
 
 @router.get("/stations")
 async def get_stations() -> Response:
-    """GeoJSON FeatureCollection of all parent stations."""
-    return Response(content=_cache.stations_geojson, media_type="application/json")
+    return Response(
+        content=cache().stations_geojson,
+        media_type="application/json",
+        headers={"Cache-Control": _STATIC_CACHE},
+    )
 
 
 @router.get("/routes")
 async def get_routes() -> Response:
-    return Response(content=orjson.dumps(_cache.routes_meta), media_type="application/json")
+    return Response(
+        content=orjson.dumps(cache().routes_meta),
+        media_type="application/json",
+        headers={"Cache-Control": _STATIC_CACHE},
+    )
 
 
 @router.get("/shapes/{route_id}")
 async def get_shapes(route_id: str) -> Response:
-    data = _cache.get_shapes_geojson(route_id)
+    data = cache().get_shapes_geojson(route_id)
     if data is None:
         raise HTTPException(status_code=404, detail=f"No shapes for route {route_id!r}")
-    return Response(content=data, media_type="application/json")
+    return Response(
+        content=data,
+        media_type="application/json",
+        headers={"Cache-Control": _STATIC_CACHE},
+    )
+
+
+@router.get("/all-shapes")
+async def get_all_shapes() -> Response:
+    """All route shapes in one request — eliminates 28 separate fetches at page load."""
+    return Response(
+        content=cache().all_shapes_bytes,
+        media_type="application/json",
+        headers={"Cache-Control": _STATIC_CACHE},
+    )
 
 
 @router.get("/shape-index")
 async def get_shape_index() -> Response:
-    return Response(content=_cache.shape_index_bytes, media_type="application/json")
+    return Response(
+        content=cache().shape_index_bytes,
+        media_type="application/json",
+        headers={"Cache-Control": _STATIC_CACHE},
+    )
+
+
+@router.get("/stop-info")
+async def get_stop_info() -> Response:
+    """All stops from Supabase stop_info table, keyed by stop_id. Cached 1h."""
+    return Response(
+        content=_stop_info_bytes,
+        media_type="application/json",
+        headers={"Cache-Control": _STATIC_CACHE},
+    )
 
 
 @router.get("/station/{station_id}/arrivals")
 async def get_station_arrivals(station_id: str) -> Response:
-    try:
-        resp = (
-            _db.table("current_trains")
-            .select("trip_id,route_id,direction,headsign,loc_stop_id,loc_station,status,next_stop,next_arr,delay_seconds")
-            .or_(f"loc_station.eq.{station_id},next_stop.like.{station_id}%")
-            .order("next_arr", nullsfirst=False)
-            .limit(12)
-            .execute()
-        )
-        return Response(
-            content=orjson.dumps({"station_id": station_id, "arrivals": resp.data or []}),
-            media_type="application/json",
-        )
-    except Exception as e:
-        return Response(
-            content=orjson.dumps({"station_id": station_id, "arrivals": [], "error": str(e)}),
-            media_type="application/json",
-        )
+    """
+    Answers from in-memory train state — no Supabase round-trip.
+    loc_station is parent station id; next_stop is platform-level (e.g. "110N").
+    """
+    trains = _ws_manager.last_trains if _ws_manager else []
+    arrivals = [
+        t for t in trains
+        if t.get("loc_station") == station_id
+        or (t.get("next_stop") or "").startswith(station_id)
+    ]
+    arrivals.sort(key=lambda t: t.get("next_arr") or "")
+
+    # Resolve station name server-side so the client always gets it
+    station_name: str | None = None
+    if station_info := _stop_info_map.get(station_id):
+        station_name = station_info.get("name")
+
+    return Response(
+        content=orjson.dumps({
+            "station_id":   station_id,
+            "station_name": station_name,
+            "arrivals":     arrivals[:12],
+        }),
+        media_type="application/json",
+        headers={"Cache-Control": _NO_CACHE},
+    )
 
 
 @router.get("/train/{trip_id}")
 async def get_train_detail(trip_id: str) -> Response:
-    try:
-        resp = (
-            _db.table("current_trains")
-            .select("*")
-            .eq("trip_id", trip_id)
-            .limit(1)
-            .execute()
-        )
-        if not resp.data:
-            raise HTTPException(status_code=404, detail="Train not found")
-        return Response(content=orjson.dumps(resp.data[0]), media_type="application/json")
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    trains = _ws_manager.last_trains if _ws_manager else []
+    match = next((t for t in trains if t.get("trip_id") == trip_id), None)
+    if not match:
+        raise HTTPException(status_code=404, detail="Train not found")
+    return Response(
+        content=orjson.dumps(match),
+        media_type="application/json",
+        headers={"Cache-Control": _NO_CACHE},
+    )
 
 
 # ── WebSocket ──────────────────────────────────────────────────────────────────
 
 @router.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    await _ws_manager.connect(websocket)
+    manager = ws()
+    await manager.connect(websocket)
     try:
-        # Keep alive; client sends no messages in normal operation
         while True:
             await websocket.receive_bytes()
     except WebSocketDisconnect:
-        _ws_manager.disconnect(websocket)
+        manager.disconnect(websocket)
     except Exception:
-        _ws_manager.disconnect(websocket)
+        manager.disconnect(websocket)
 
 
 # ── Mount ──────────────────────────────────────────────────────────────────────
 
+
+class NoCacheStaticFiles(StaticFiles):
+    """Serve web assets with `no-cache` so browsers always revalidate.
+
+    ES module imports (app.js → ./MapManager.js, …) are fetched directly by the
+    browser and would otherwise be cached aggressively, leaving users on stale
+    code after a deploy. `no-cache` forces a conditional request; unchanged files
+    still return a fast 304 (StaticFiles sends an ETag), so the cost is one
+    round-trip, not a full re-download.
+    """
+
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 app.include_router(router)
 app.mount(
     "/",
-    StaticFiles(directory=str(Path(__file__).parent.parent / "web"), html=True),
+    NoCacheStaticFiles(directory=str(Path(__file__).parent.parent / "web"), html=True),
     name="web",
 )

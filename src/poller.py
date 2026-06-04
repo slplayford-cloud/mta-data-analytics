@@ -19,11 +19,12 @@ from nyct_gtfs import NYCTFeed
 from nyct_gtfs.trip import Trip
 
 from src import ingestion
+from src.ingestion import _stu_time
 
 log = logging.getLogger(__name__)
 
 FEED_GROUPS    = ["1", "A", "B", "G", "J", "N", "L", "SI"]
-POLL_INTERVAL  = 30.0
+POLL_INTERVAL  = 15.0  # MTA feeds refresh every 15-30s; polling at 15s gives fresher positions
 
 
 def _derive_service_date(now: datetime) -> date:
@@ -38,7 +39,7 @@ class Poller:
         self,
         db: Client,
         interval: float = POLL_INTERVAL,
-        ws_broadcast: Callable[[bytes], None] | None = None,
+        ws_broadcast: Callable[[bytes, list], None] | None = None,
     ) -> None:
         self._db          = db
         self._interval    = interval
@@ -103,7 +104,7 @@ class Poller:
                 if not trip.underway:
                     continue
                 current = {
-                    stu.stop_id: (stu.arrival or stu.departure, stu.stop_name)
+                    stu.stop_id: (_stu_time(stu.arrival) or _stu_time(stu.departure), stu.stop_name)
                     for stu in trip.stop_time_updates
                 }
                 if trip.trip_id in ingestion._last_predictions:
@@ -143,7 +144,7 @@ class Poller:
                 "trains": rows,
             })
             try:
-                self._ws_broadcast(payload)
+                self._ws_broadcast(payload, rows)
             except Exception:
                 log.warning("WS broadcast failed", exc_info=True)
 
@@ -191,7 +192,7 @@ class Poller:
 
         if next_stu:
             next_stop = next_stu.stop_id
-            arr = next_stu.arrival or next_stu.departure
+            arr = _stu_time(next_stu.arrival) or _stu_time(next_stu.departure)
             if arr:
                 next_arr = arr.isoformat()
                 sched_entry = ingestion._schedules.get(trip.trip_id, {}).get(next_stop)

@@ -1,15 +1,12 @@
 /**
  * SubwayApp — bootstraps all managers and wires them together.
  *
- * Boot sequence:
- *  1. Fetch /api/routes + /api/stations + /api/shape-index in parallel
- *  2. Init LineFilter (route toggle buttons)
- *  3. Wait for MapLibre to load
- *  4. Fetch all route shapes in parallel (28 requests at once)
- *  5. Add route line layers (map renders track geometry immediately)
- *  6. Add station circles
- *  7. Add train layer (empty until first WS message)
- *  8. Connect WebSocket → trains populate after first poll
+ * Boot sequence (optimised):
+ *  1. Kick off ALL data fetches in parallel — routes, stations, shape-index, ALL shapes
+ *  2. Init LineFilter (pure DOM, no map needed)
+ *  3. Wait for Leaflet + data fetches to complete (both resolve nearly instantly)
+ *  4. Add route line layers, station circles, train layer
+ *  5. Connect WebSocket → trains appear immediately from cached last payload
  */
 
 import { MapManager }       from './MapManager.js';
@@ -39,26 +36,60 @@ class SubwayApp {
     const loadingEl = document.getElementById('loading');
 
     try {
-      // ── 1. Parallel static data fetch ─────────────────────────────────────
-      const [routesMeta, stationsGeoJSON, shapeIdx] = await Promise.all([
+      // ── 1. Parallel fetch of ALL static data + wait for map ───────────────
+      // All-shapes fetched in the same batch — one request instead of 28.
+      const [routesMeta, stationsGeoJSON, shapeIdx, allShapesGeoJSON] = await Promise.all([
         fetch('/api/routes').then(r => r.json()),
         fetch('/api/stations').then(r => r.json()),
         fetch('/api/shape-index').then(r => r.json()),
+        fetch('/api/all-shapes').then(r => r.json()),
+        this._mapManager.waitForLoad(),  // map init runs concurrently
       ]);
 
-      // Build platform-level stop coords map from stations GeoJSON
-      // Stations GeoJSON only has parent stations; platforms are derived:
-      // e.g. station "109" → platforms "109N" and "109S" at same coords
-      const allStopCoords = new Map();
+      // ── Build lookup structures ───────────────────────────────────────────
+
+      // stop_id → human-readable name (seeded immediately from GeoJSON, enriched
+      // below from stop_info). TrainManager derives its own coord lookup from the
+      // same GeoJSON and resolves platform ids (e.g. "L06N") to the parent stop
+      // by stripping the suffix, so no separate N/S coord map is needed here.
+      const stopNameMap = new Map();
       for (const f of stationsGeoJSON.features) {
-        const [lon, lat] = f.geometry.coordinates;
-        const id = f.properties.id;
-        allStopCoords.set(id, [lon, lat]);
-        allStopCoords.set(id + 'N', [lon, lat]);
-        allStopCoords.set(id + 'S', [lon, lat]);
+        const { id, name } = f.properties;
+        if (name) stopNameMap.set(id, name);
+      }
+      // Set names now so station clicks work immediately
+      this._infoPanel.setStopNames(stopNameMap);
+
+      // Enrich with full stop_info table in the background — adds platform-level
+      // accuracy and any stops not in the parent-station GeoJSON
+      fetch('/api/stop-info')
+        .then(r => r.ok ? r.json() : null)
+        .then(info => {
+          if (!info) return;
+          for (const [id, s] of Object.entries(info)) {
+            if (s && s.name) stopNameMap.set(id, s.name);
+          }
+        })
+        .catch(() => {});
+
+      // shape_id → [[lon,lat],...] for interpolation
+      const shapeGeomMap = new Map();
+      // route_id → [GeoJSON Feature,...] for route line layers
+      const shapesByRoute = new Map();
+
+      for (const feat of allShapesGeoJSON.features) {
+        const sid = feat.properties?.shape_id;
+        const rid = feat.properties?.route_id;
+        if (sid && feat.geometry?.coordinates) {
+          shapeGeomMap.set(sid, feat.geometry.coordinates);
+        }
+        if (rid) {
+          if (!shapesByRoute.has(rid)) shapesByRoute.set(rid, []);
+          shapesByRoute.get(rid).push(feat);
+        }
       }
 
-      // ── 2. Route toggle buttons (before map loads — pure DOM) ──────────────
+      // ── 2. Route toggle buttons ───────────────────────────────────────────
       this._routeManager = new RouteManager(this._mapManager, routesMeta);
       this._infoPanel.setRouteColors(routesMeta);
       this._lineFilter.init(routesMeta, (routeId, visible) => {
@@ -66,57 +97,35 @@ class SubwayApp {
         if (this._trainManager) this._trainManager.setRouteVisible(routeId, visible);
       });
 
-      // ── 3. Wait for MapLibre ───────────────────────────────────────────────
-      await this._mapManager.waitForLoad();
-
-      // ── 4. Parallel shape fetch (all routes at once) ──────────────────────
-      const shapeFetches = routesMeta.map(r =>
-        fetch(`/api/shapes/${r.route_id}`)
-          .then(res => res.ok ? res.json() : null)
-          .then(geojson => ({ route_id: r.route_id, geojson }))
-          .catch(() => ({ route_id: r.route_id, geojson: null }))
-      );
-      const shapeResults = await Promise.all(shapeFetches);
-
-      // Build shape geometry map for interpolation: shape_id → [[lon, lat], ...]
-      const shapeGeomMap = new Map();
-      for (const { geojson } of shapeResults) {
-        if (!geojson) continue;
-        for (const feat of geojson.features ?? []) {
-          const sid = feat.properties?.shape_id;
-          if (sid && feat.geometry?.coordinates) {
-            shapeGeomMap.set(sid, feat.geometry.coordinates);
-          }
-        }
+      // ── 3. Route line layers ──────────────────────────────────────────────
+      for (const [route_id, features] of shapesByRoute) {
+        this._routeManager.addRouteLayer(
+          route_id,
+          { type: 'FeatureCollection', features },
+        );
       }
 
-      // ── 5. Route line layers ───────────────────────────────────────────────
-      for (const { route_id, geojson } of shapeResults) {
-        if (geojson) this._routeManager.addRouteLayer(route_id, geojson);
-      }
-
-      // ── 6. Station circles + labels ───────────────────────────────────────
+      // ── 4. Station circles + labels ───────────────────────────────────────
       this._stationManager = new StationManager(
         this._mapManager, stationsGeoJSON, this._infoPanel,
       );
       this._stationManager.init();
 
-      // ── 7. Train layer ────────────────────────────────────────────────────
+      // ── 5. Train layer ────────────────────────────────────────────────────
       this._trainManager = new TrainManager(
         this._mapManager,
         routesMeta,
         shapeIdx,
         shapeGeomMap,
         stationsGeoJSON,
-        allStopCoords,
       );
       this._trainManager.init();
       this._trainManager.onTrainClick(train => this._infoPanel.showTrain(train));
 
-      // Hide loading overlay (map + routes are visible)
       loadingEl.classList.add('hidden');
 
-      // ── 8. WebSocket for live train updates ───────────────────────────────
+      // ── 6. WebSocket ──────────────────────────────────────────────────────
+      // Server sends last snapshot immediately on connect — trains appear at once.
       this._wsClient = new WebSocketClient('/api/ws');
       this._wsClient.onTrains(rows => this._trainManager.update(rows));
       this._wsClient.connect();

@@ -1,6 +1,6 @@
 # MTA Data Analytics
 
-This is a personal project which I am working on to explore solving a problem like NYC subway delays (something every new yorker has experienced) and build my technical skills.
+This is a personal project which I am working on to explore solving a problem like NYC subway delays (something every new yorker has experienced) and build my technical skills. This is something I find very personally interesting because I feel like my trains are getting delayed every other week.
 
 ## What it does
 

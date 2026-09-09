@@ -215,35 +215,56 @@ class Poller:
         today: date,
         now: datetime,
     ) -> None:
-        """Write to Supabase off the event loop. Failures are logged, not fatal."""
-        def write() -> None:
-            if new_trips:
-                self._upsert("trips", [t.as_row() for t in new_trips],
-                             "service_date,trip_id")
-            if visits:
-                self._upsert("stop_visits", [v.as_row() for v in visits],
-                             "service_date,trip_id,stop_id")
-            if positions:
-                rows = [p.as_db_row(today, now) for p in positions]
-                self._upsert("current_trains", rows, "trip_id")
-                self._delete_departed({p.trip_id for p in positions})
+        """Write this cycle's results to Postgres.
 
+        THIS METHOD IS YOURS TO WRITE. See docs/01-schema.md.
+
+        Called after positions have already been broadcast to the map, so
+        nothing here is on the critical path for the UI.
+        """
+        def write() -> None:
+            # TODO(you): Persist trips, stop_visits and current_trains.
+            #   Why: Three tables with three different write patterns. New trips
+            #        are append-mostly. Stop visits are append-only and the
+            #        highest volume in the system. Current trains is a full
+            #        replacement of ~800 rows every cycle. The same code shape
+            #        does not suit all three.
+            #   Hint: The poller can observe the same departure twice if a feed
+            #         repeats itself, so writes must be safe to repeat -- look up
+            #         what "idempotent" means for an INSERT. Your primary keys
+            #         from migration 003 decide the conflict target.
+            #   Verify: run the server, then check row counts climb:
+            #           select count(*) from stop_visits;
+            pass
+
+        # to_thread keeps the blocking database driver off the event loop, so a
+        # slow write cannot stall the next poll or the WebSocket broadcast.
         await asyncio.to_thread(write)
 
     def _upsert(self, table: str, rows: list[dict], on_conflict: str) -> None:
-        for start in range(0, len(rows), _WRITE_CHUNK):
-            chunk = rows[start:start + _WRITE_CHUNK]
-            try:
-                self._db.table(table).upsert(chunk, on_conflict=on_conflict).execute()
-            except Exception:
-                log.warning("%s upsert failed (%d rows)", table, len(chunk), exc_info=True)
+        """Write rows to one table."""
+        # TODO(you): Implement the write, in batches, without letting it crash the poller.
+        #   Why: Two independent concerns. Batching: ~400 rows per cycle in one
+        #        request is fine, 400 separate requests is not, and there is an
+        #        upper limit where the request body gets rejected. Failure: a
+        #        database hiccup must not kill the poll loop, because the live
+        #        map does not depend on the database at all and should survive
+        #        an outage.
+        #   Hint: The Supabase client is self._db.table(name).upsert(...). Decide
+        #         what a sensible chunk size is and what you want in the log when
+        #         a write fails -- you will be reading those logs later.
+        #   Verify: stop your database mid-run; the map must keep updating.
+        pass
 
     def _delete_departed(self, active_ids: set[str]) -> None:
-        try:
-            self._db.table("current_trains").delete() \
-                .not_.in_("trip_id", list(active_ids)).execute()
-        except Exception:
-            log.debug("current_trains cleanup failed", exc_info=True)
+        """Remove trains that are no longer running."""
+        # TODO(you): Delete current_trains rows for trips not in active_ids.
+        #   Why: Without this, current_trains accumulates every train that ever
+        #        ran and the live map slowly fills with ghosts.
+        #   Hint: There is a subtle failure here -- think about what this does on
+        #         a cycle where every feed failed and active_ids is empty.
+        #   Verify: select count(*) from current_trains;  -- should hover ~800
+        pass
 
 
 def _tier_counts(ingestor: Ingestor) -> str:

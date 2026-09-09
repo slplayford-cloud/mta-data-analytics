@@ -224,4 +224,5 @@ pyrightconfig.json
 static/*.txt
 static/_shape_stop_index.json
 
+# Design notes and scratch docs — kept local, not part of the repo
 docs/

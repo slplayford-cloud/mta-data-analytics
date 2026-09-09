@@ -15,7 +15,7 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 from dataclasses import asdict
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import cast
 
@@ -30,6 +30,7 @@ from supabase import create_client
 from src.cache import StaticDataCache
 from src.config import config
 from src.poller import Poller, TrainPosition
+from src import queries
 from src.schedule import ScheduleIndex
 
 logging.basicConfig(
@@ -263,6 +264,64 @@ async def get_train(trip_id: str) -> Response:
         if train.get("trip_id") == trip_id:
             return _json(orjson.dumps(train), NO_CACHE)
     raise HTTPException(status_code=404, detail="Train not found")
+
+
+# ── Historical queries ────────────────────────────────────────────────────────
+#
+# The HTTP layer is done: parsing, validation and error handling all work. Each
+# endpoint calls into src/queries.py, where the SQL is yours to write. Until
+# then these return empty results rather than failing.
+
+def _parse_date(value: str, field: str) -> date:
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        raise HTTPException(status_code=400,
+                            detail=f"{field} must be YYYY-MM-DD, got {value!r}")
+
+
+def _query(fn, *args):
+    """Run a query function, turning a missing database into a clear 503."""
+    try:
+        return fn(*args)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        log.exception("query failed")
+        raise HTTPException(status_code=500, detail=f"query failed: {exc}")
+
+
+@router.get("/history/station/{station_id}")
+async def history_station(station_id: str, start: str, end: str) -> Response:
+    rows = _query(queries.station_delays, station_id,
+                  _parse_date(start, "start"), _parse_date(end, "end"))
+    return _json(orjson.dumps(rows), NO_CACHE)
+
+
+@router.get("/history/worst-stations")
+async def history_worst_stations(start: str, end: str, limit: int = 20) -> Response:
+    rows = _query(queries.worst_stations,
+                  _parse_date(start, "start"), _parse_date(end, "end"), limit)
+    return _json(orjson.dumps(rows), NO_CACHE)
+
+
+@router.get("/history/route/{route_id}/by-hour")
+async def history_route_by_hour(route_id: str, start: str, end: str) -> Response:
+    rows = _query(queries.route_delays_by_hour, route_id,
+                  _parse_date(start, "start"), _parse_date(end, "end"))
+    return _json(orjson.dumps(rows), NO_CACHE)
+
+
+@router.get("/history/trip/{service_date}/{trip_id}")
+async def history_trip(service_date: str, trip_id: str) -> Response:
+    row = _query(queries.trip_detail, _parse_date(service_date, "service_date"), trip_id)
+    return _json(orjson.dumps(row), NO_CACHE)
+
+
+@router.get("/history/summary/{day}")
+async def history_summary(day: str) -> Response:
+    rows = _query(queries.daily_summary, _parse_date(day, "day"))
+    return _json(orjson.dumps(rows), NO_CACHE)
 
 
 @router.websocket("/ws")

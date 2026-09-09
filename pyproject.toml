@@ -48,6 +48,8 @@ dependencies = [
     "pyparsing==3.3.2",
     "pyright==1.1.410",
     "pyroaring==1.1.0",
+    "pytest==9.1.1",
+    "psycopg[binary]==3.3.5",
     "python-dateutil==2.9.0.post0",
     "python-dotenv==1.2.2",
     "pytz==2026.2",

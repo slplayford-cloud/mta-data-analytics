@@ -45,6 +45,10 @@ class Config:
     # Empty is allowed — the frontend reports a clear error instead of a blank map.
     mapbox_token: str
 
+    # Direct Postgres connection, used by src/queries.py for raw SQL and EXPLAIN.
+    # Separate from the Supabase client, which goes through PostgREST.
+    database_url: str
+
     static_dir: Path
     poll_interval: float
 
@@ -54,6 +58,7 @@ class Config:
             supabase_url=_required("SUPABASE_URL"),
             supabase_service_key=_required("SUPABASE_SERVICE_KEY"),
             mapbox_token=_optional("MAPBOX_TOKEN"),
+            database_url=_optional("DATABASE_URL"),
             static_dir=PROJECT_ROOT / "static",
             poll_interval=float(_optional("POLL_INTERVAL", "15")),
         )

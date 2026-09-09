@@ -2,9 +2,6 @@
 
 This is a personal project which I am working on to explore solving a problem like NYC subway delays (something every new yorker has experienced) and build my technical skills. This is something I find very personally interesting because I feel like my trains are getting delayed every other week.
 
-A personal project exploring NYC subway delays, something every New Yorker has
-experienced, and building my technical skills along the way.
-
 I restarted work on this project because I felt I lost ownership of the core functions and wanted to ensure I used this as a learning experience.
 
 ## Building Process

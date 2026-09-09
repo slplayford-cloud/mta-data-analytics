@@ -223,3 +223,5 @@ pyrightconfig.json
 # Static GTFS bundle — regenerate with: python scripts/refresh_gtfs.py
 static/*.txt
 static/_shape_stop_index.json
+
+docs/

@@ -2,51 +2,43 @@
 
 This is a personal project which I am working on to explore solving a problem like NYC subway delays (something every new yorker has experienced) and build my technical skills. This is something I find very personally interesting because I feel like my trains are getting delayed every other week.
 
+A personal project exploring NYC subway delays, something every New Yorker has
+experienced, and building my technical skills along the way.
+
+## Building Process
+This project is a passion project of mine, however, I also want to note that this is the first time I have every tried a project like this. For this reason, I worked alongside a Claude agent to give me ONLY the boilerplate code. I wrote everything of substance in this project including ingestion, database structure, and more. 
+
+I restarted work on this project because I felt I lost ownership of the core functions and wanted to ensure I used this as a learning experience.
+
+## What I didn't write
+I did not write most of the frontend of this project. That is not a passion of mine and to me is more of a means to an end. For that reason most of the frontend uses AI generated code
+
 ## What it does
 
-- Pulls data for 8 different train feeds from MTA realtime data(1/2/3/4/5/6/7, A/C/E, B/D/F/M, G, J/Z, N/Q/R/W, L, Staten Island Railway)
-- Uses static and live data to build out expected arrival times for each stop
-- Stores all the information in a personal supabase database for later analysis
-- Also includes a simple (AI assisted coding) frontend in order to help users interact with the data
+- Polls all 8 MTA realtime feeds (1/2/3/4/5/6/7, A/C/E, B/D/F/M, G, J/Z, N/Q/R/W, L, SIR)
+- Resolves each live train to its scheduled baseline, then records every departure
+- Stores trips and stop visits in Supabase for later analysis
+- Serves a live Mapbox map of every train in the system
 
-
-## Database tables
-
-| Table | Purpose |
-|---|---|
-| `current_trains` | One row per active train; upserted every poll. Drives the live map. |
-| `trip_schedules` | Full stop list + predicted arrival times, snapshotted when a trip is first seen. |
-| `stop_visits` | One row per stop departure — scheduled vs actual arrival and delay in seconds. |
-
-Simple database structure to start with data collection -- moving towards a more developed table for information caching
-
-## Tech Stack
-
-| Layer | Technology |
-|---|---|
-| Feed parsing | `nyct-gtfs` 2.1.0 |
-| API server | FastAPI + uvicorn |
-| Database | Supabase (PostgreSQL) |
-| Static GTFS | MTA `stop_times.txt`, `trips.txt`, `shapes.txt`, `stops.txt` |
-| Frontend map | Leaflet 1.9.4 + vanilla JS |
-| Serialisation | `orjson` |
 
 ## Running
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
-or use uv package manager to install
+pip install -r requirements.txt      # or: uv sync
 
-# Set environment variables
-export SUPABASE_URL=...
-export SUPABASE_SERVICE_KEY=...
+cp .env.example .env                 # then fill in SUPABASE_* and MAPBOX_TOKEN
 
-# Start the server (map + poller together)
+python scripts/refresh_gtfs.py       # static GTFS is not committed; fetch it
 python run_server.py
-
-# Or run the ingestion pipeline standalone
-python -m src.ingestion
 ```
 
-The server is available at `http://localhost:8000`.
+The map is at http://localhost:8000.
+
+## Scripts
+
+```bash
+python scripts/refresh_gtfs.py            # download the current GTFS bundle
+python scripts/refresh_gtfs.py --check    # non-zero exit if it expires within 14 days
+python scripts/check_match_rate.py        # tier coverage against the live feeds
+pytest                                    # unit tests, no network needed
+```

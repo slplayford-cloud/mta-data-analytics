@@ -9,7 +9,6 @@ charset-normalizer==3.4.7
 click==8.4.1
 cryptography==48.0.0
 deprecation==2.1.0
-duckdb==1.5.2
 fastapi==0.136.3
 fsspec==2026.4.0
 h11==0.16.0
@@ -23,9 +22,7 @@ idna==3.14
 markdown-it-py==4.2.0
 mdurl==0.1.2
 mmh3==5.2.1
--e git+ssh://git@github.com/slplayford-cloud/mta-data-analytics.git@bc72bc732152f85357600a96dc2869939e1b1e64#egg=mta_data_analytics
 multidict==6.7.1
-networkx==3.6.1
 nodeenv==1.10.0
 nodejs-wheel-binaries==24.15.0
 nyct-gtfs==2.1.0
@@ -68,3 +65,4 @@ watchfiles==1.2.0
 websockets==15.0.1
 yarl==1.24.2
 zstandard==0.25.0
+pytest==9.1.1

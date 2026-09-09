@@ -1,330 +1,280 @@
 /**
- * TrainManager — animates ~300 train positions at 30fps on a plain HTML Canvas
- * overlaid on the Leaflet map. No WebGL, no GeoJSON worker, no JSON
- * serialisation — just ctx.arc() calls per frame.
+ * TrainManager — animates live train positions.
  *
- * The canvas sits outside Leaflet's pane system (pointer-events: none) so
- * Leaflet's station click handlers work normally. Train clicks are detected
- * via a hit-test on the map's 'click' event.
+ * The feed gives a position roughly every 15 seconds. Drawing that directly
+ * makes trains teleport, so each train is interpolated along its real route
+ * geometry between where it was last seen and where it is predicted next.
+ *
+ * Positions go into one GeoJSON source refreshed at 30fps. Mapbox draws and hit
+ * tests them on the GPU, so there is no canvas overlay and no manual picking.
  */
 
-// ── TrainState ─────────────────────────────────────────────────────────────
-// Unchanged from original — handles position interpolation along shape geometry.
+const FRAME_MS = 1000 / 30;
 
+// A degree of longitude is shorter than a degree of latitude, by cos(latitude).
+// Without this correction, distances along east-west track are overstated and
+// trains drift ahead of their true position on crosstown segments.
+const LON_SCALE = Math.cos(40.75 * Math.PI / 180);
+
+const clamp01 = value => (value < 0 ? 0 : value > 1 ? 1 : value);
+
+
+/** One train's position state, interpolated between feed updates. */
 class TrainState {
-  constructor(row, receivedAt, shapeGeom, shapeIdx, routeColors, stopCoords, shapePrefix) {
-    this._shapeGeom   = shapeGeom;
-    this._shapeIdx    = shapeIdx;
-    this._routeColors = routeColors;
-    this._stopCoords  = stopCoords;
-    this._shapePrefix = shapePrefix;
-    this._lastPos     = null;
-    this._fromIdx     = -1;
-    this._toIdx       = -1;
-    this._resolvedShapeId = null;
-    this._color       = '#888888';
-    this._precomp     = null;
-    this.applyUpdate(row, receivedAt);
+  constructor(row, receivedAt, context) {
+    this._context  = context;
+    this._lastPos  = null;
+    this._segment  = null;
+    this.apply(row, receivedAt);
   }
 
-  applyUpdate(row, receivedAt) {
-    this._lastPos   = this._fromIdx >= 0 ? this.interpolatedPosition(receivedAt) : null;
-    this.tripId     = row.trip_id;
-    this.routeId    = row.route_id;
-    this.direction  = row.direction;
-    this.headsign   = row.headsign;
-    this.locStopId  = row.loc_stop_id;
-    this.locStation = row.loc_station;
-    this.status     = row.status;
-    this.nextStop   = row.next_stop;
-    this.nextArr    = row.next_arr ? new Date(row.next_arr).getTime() / 1000 : null;
-    this.delay      = row.delay_seconds ?? null;
-    this.rawShapeId = row.shape_id;
-    this.receivedAt = receivedAt;
-    this._color     = '#' + (this._routeColors.get(this.routeId) || '888888');
-    this._resolveShapeId();
-    this._precomputeIndices();
+  apply(row, receivedAt) {
+    // Snapshot where we currently think it is, so a new update animates from
+    // there rather than jumping.
+    this._lastPos = this._segment ? this.positionAt(receivedAt) : null;
+
+    Object.assign(this, row);
+    this.receivedAt   = receivedAt;
+    this._nextArrTime = row.next_arr ? Date.parse(row.next_arr) / 1000 : null;
+    this._color       = this._context.routeColors.get(row.route_id) ?? '888888';
+
+    this._resolveShape();
+    this._buildSegment();
   }
 
-  _resolveShapeId() {
-    if (!this.rawShapeId) { this._resolvedShapeId = null; return; }
-    if (this._shapeGeom.has(this.rawShapeId)) { this._resolvedShapeId = this.rawShapeId; return; }
-    const cached = this._shapePrefix.get(this.rawShapeId);
-    if (cached) { this._resolvedShapeId = cached; return; }
-    for (const key of this._shapeGeom.keys()) {
-      if (key.startsWith(this.rawShapeId)) {
-        this._shapePrefix.set(this.rawShapeId, key);
-        this._resolvedShapeId = key;
+  get color()  { return `#${this._color}`; }
+
+  /** Realtime shape ids are sometimes a prefix of the static ones. */
+  _resolveShape() {
+    const { shapeGeom, shapePrefix } = this._context;
+    const raw = this.shape_id;
+    if (!raw)                { this._shapeId = null; return; }
+    if (shapeGeom.has(raw))  { this._shapeId = raw;  return; }
+
+    const cached = shapePrefix.get(raw);
+    if (cached) { this._shapeId = cached; return; }
+
+    for (const key of shapeGeom.keys()) {
+      if (key.startsWith(raw)) {
+        shapePrefix.set(raw, key);
+        this._shapeId = key;
         return;
       }
     }
-    this._resolvedShapeId = null;
+    this._shapeId = null;
   }
 
-  _precomputeIndices() {
-    this._precomp = null;
-    const sid = this._resolvedShapeId;
-    if (!sid) { this._fromIdx = -1; this._toIdx = -1; return; }
-    const idx = this._shapeIdx[sid];
-    if (!idx) { this._fromIdx = -1; this._toIdx = -1; return; }
-    this._fromIdx = idx[this.locStopId] ?? idx[this.locStation] ?? -1;
-    this._toIdx   = idx[this.nextStop]  ?? -1;
-    if (this._fromIdx >= 0 && this._toIdx >= 0 && this._fromIdx !== this._toIdx) {
-      const coords   = this._shapeGeom.get(sid);
-      if (coords) {
-        const segStart = Math.min(this._fromIdx, this._toIdx);
-        const segEnd   = Math.max(this._fromIdx, this._toIdx);
-        const n        = segEnd - segStart + 1;
-        const lens     = new Float64Array(n);
-        let total = 0;
-        for (let i = 1; i < n; i++) {
-          const a  = coords[segStart + i - 1];
-          const b  = coords[segStart + i];
-          const dx = b[0] - a[0], dy = b[1] - a[1];
-          total += Math.sqrt(dx * dx + dy * dy);
-          lens[i] = total;
-        }
-        this._precomp = { coords, lens, total, segStart };
-      }
+  /**
+   * Precompute the run of shape vertices between the train's current stop and
+   * its next one, with cumulative distances, so each frame is a binary search
+   * rather than a walk.
+   */
+  _buildSegment() {
+    this._segment = null;
+    const { shapeGeom, shapeIndex } = this._context;
+    if (!this._shapeId || !this.next_stop) return;
+
+    const coords = shapeGeom.get(this._shapeId);
+    const index  = shapeIndex[this._shapeId];
+    if (!coords || !index) return;
+
+    const from = index[this.loc_stop_id] ?? index[this.loc_station];
+    const to   = index[this.next_stop];
+    if (from === undefined || to === undefined || to <= from) return;
+
+    const slice = coords.slice(from, to + 1);
+    if (slice.length < 2) return;
+
+    const lengths = new Float64Array(slice.length);
+    let total = 0;
+    for (let i = 1; i < slice.length; i++) {
+      const dx = (slice[i][0] - slice[i - 1][0]) * LON_SCALE;
+      const dy =  slice[i][1] - slice[i - 1][1];
+      total += Math.hypot(dx, dy);
+      lengths[i] = total;
     }
+    if (total <= 0) return;
+
+    this._segment = { coords: slice, lengths, total };
   }
 
-  interpolatedPosition(now) {
-    if (!this.locStopId && !this.locStation) return this._lastPos;
-    if (this.status === 'STOPPED_AT')
-      return this._stationCoords(this.locStopId) || this._stationCoords(this.locStation);
-    if (!this.nextArr || !this.nextStop)
-      return this._stationCoords(this.locStopId) || this._stationCoords(this.locStation) || this._lastPos;
-    const total = this.nextArr - this.receivedAt;
-    if (total <= 0) return this._stationCoords(this.nextStop) || this._lastPos;
-    const progress = Math.min(1, Math.max(0, (now - this.receivedAt) / total));
-    if (this._precomp) {
-      const pos = this._interpolateAlongShape(progress);
-      if (pos) return pos;
-    }
-    const from = this._stationCoords(this.locStopId) || this._stationCoords(this.locStation);
-    const to   = this._stationCoords(this.nextStop);
-    if (from && to) return [from[0] + (to[0] - from[0]) * progress, from[1] + (to[1] - from[1]) * progress];
-    return from || to || this._lastPos;
-  }
-
-  _interpolateAlongShape(progress) {
-    const { coords, lens, total, segStart } = this._precomp;
-    if (!total) return coords[segStart];
-    const target = progress * total;
-    let lo = 0, hi = lens.length - 2;
-    while (lo < hi) {
-      const mid = (lo + hi) >> 1;
-      if (lens[mid + 1] < target) lo = mid + 1; else hi = mid;
-    }
-    const span = lens[lo + 1] - lens[lo];
-    const t    = span ? (target - lens[lo]) / span : 0;
-    const i    = segStart + lo;
-    const a    = coords[i], b = coords[i + 1];
-    return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
-  }
-
-  _stationCoords(stopId) {
+  stationCoords(stopId) {
     if (!stopId) return null;
-    return this._stopCoords.get(stopId) || this._stopCoords.get(stopId.slice(0, -1)) || null;
+    const { stopCoords } = this._context;
+    return stopCoords.get(stopId) ?? stopCoords.get(stopId.slice(0, -1)) ?? null;
   }
 
-  color()  { return this._color; }
+  positionAt(now) {
+    if (this.status === 'STOPPED_AT') {
+      return this.stationCoords(this.loc_stop_id) ?? this.stationCoords(this.loc_station) ?? this._lastPos;
+    }
+    if (!this._nextArrTime || !this.next_stop) {
+      return this.stationCoords(this.loc_station) ?? this._lastPos;
+    }
 
-  toInfoObject() {
-    return {
-      trip_id:       this.tripId,
-      route_id:      this.routeId,
-      headsign:      this.headsign,
-      direction:     this.direction,
-      status:        this.status,
-      delay_seconds: this.delay,
-      loc_station:   this.locStation,
-      loc_stop_id:   this.locStopId,
-      next_stop:     this.nextStop,
-      next_arr:      this.nextArr,
-    };
+    const span = this._nextArrTime - this.receivedAt;
+    if (span <= 0) return this.stationCoords(this.next_stop) ?? this._lastPos;
+
+    const progress = clamp01((now - this.receivedAt) / span);
+    if (this._segment) return this._alongShape(progress);
+
+    // No usable geometry — fall back to a straight line between stations.
+    const from = this._lastPos ?? this.stationCoords(this.loc_station);
+    const to   = this.stationCoords(this.next_stop);
+    if (!from || !to) return from ?? to;
+    return [
+      from[0] + (to[0] - from[0]) * progress,
+      from[1] + (to[1] - from[1]) * progress,
+    ];
+  }
+
+  _alongShape(progress) {
+    const { coords, lengths, total } = this._segment;
+    const target = progress * total;
+
+    let low = 0, high = lengths.length - 1;
+    while (low < high - 1) {
+      const mid = (low + high) >> 1;
+      if (lengths[mid] <= target) low = mid; else high = mid;
+    }
+
+    const span = lengths[high] - lengths[low];
+    const ratio = span > 0 ? (target - lengths[low]) / span : 0;
+    return [
+      coords[low][0] + (coords[high][0] - coords[low][0]) * ratio,
+      coords[low][1] + (coords[high][1] - coords[low][1]) * ratio,
+    ];
   }
 }
 
-// ── TrainManager ───────────────────────────────────────────────────────────
 
 export class TrainManager {
-  constructor(mapManager, routesMeta, shapeIdx, shapeGeomMap, stationsGeoJSON) {
-    this._leaflet     = mapManager.leaflet;
-    this._shapeIdx    = shapeIdx;
-    this._shapeGeom   = shapeGeomMap;
-    this._routeColors = new Map(routesMeta.map(r => [r.route_id, r.color]));
-    this._visibleRoutes = new Set(routesMeta.map(r => r.route_id));
+  constructor(mapManager, routesMeta, shapeIndex, shapeGeom, stationsGeoJSON) {
+    this._map    = mapManager.map;
+    this._trains = new Map();
+    this._visibleRoutes = new Set(routesMeta.map(route => route.route_id));
+    this._onClick = () => {};
+    this._frameId = null;
+    this._lastFrame = 0;
 
-    // Parent-station coords keyed by stop_id. Platform ids ("L06N") resolve to
-    // the parent via suffix-stripping in _stationCoords(), so only parents are stored.
-    this._stopCoords = new Map();
-    for (const f of stationsGeoJSON.features) {
-      const [lon, lat] = f.geometry.coordinates;
-      this._stopCoords.set(f.properties.id, [lon, lat]);
+    const stopCoords = new Map();
+    for (const feature of stationsGeoJSON.features) {
+      stopCoords.set(feature.properties.id, feature.geometry.coordinates);
     }
 
-    this._shapePrefix = new Map();
-    this._trains      = new Map();
-    this._clickCb     = null;
-    this._rafId       = null;
-
-    // The canvas that draws train circles — positioned over the Leaflet map
-    this._canvas = document.createElement('canvas');
-    this._ctx    = this._canvas.getContext('2d');
+    this._context = {
+      routeColors: new Map(routesMeta.map(route => [route.route_id, route.color])),
+      shapeIndex,
+      shapeGeom,
+      stopCoords,
+      shapePrefix: new Map(),
+    };
   }
 
   init() {
-    // Sit above all Leaflet panes; pointer-events:none lets clicks pass through
-    // to station CircleMarkers and the map itself.
-    // z-index:1000 is safe here because #map has z-index:0, which creates a
-    // stacking context that isolates internal z-indexes from UI overlays.
-    const s = this._canvas.style;
-    s.position      = 'absolute';
-    s.top           = s.left = '0';
-    s.width         = '100%';
-    s.height        = '100%';
-    s.pointerEvents = 'none';
-    s.zIndex        = '1000';
-
-    this._leaflet.getContainer().appendChild(this._canvas);
-    this._resize();
-
-    // Keep canvas sized to the container
-    this._leaflet.on('resize', () => this._resize());
-
-    // Render immediately when the map pans/zooms so trains don't lag
-    this._leaflet.on('move zoom viewreset', () => {
-      if (this._trains.size > 0) this._render();
+    this._map.addSource('trains', {
+      type: 'geojson',
+      data: { type: 'FeatureCollection', features: [] },
     });
 
-    // Train click: hit-test on map click event (canvas has pointer-events:none)
-    this._leaflet.on('click', e => this._handleMapClick(e));
+    this._map.addLayer({
+      id:     'trains',
+      type:   'circle',
+      source: 'trains',
+      paint: {
+        'circle-radius': [
+          'interpolate', ['linear'], ['zoom'],
+          10, 3.5,
+          13, 6,
+          16, 10,
+        ],
+        'circle-color': ['get', 'color'],
+        // A stalled train is one the MTA has not seen move; ring it in red so it
+        // reads differently from a train that is merely running late.
+        'circle-stroke-color': ['case', ['get', 'stalled'], '#ff4d4d', '#ffffff'],
+        'circle-stroke-width': ['case', ['get', 'stalled'], 2.5, 1.5],
+      },
+    });
 
-    // Pointer cursor when hovering over a train
-    this._leaflet.on('mousemove', e => this._handleMouseMove(e));
+    this._map.on('click', 'trains', event => {
+      const feature = event.features?.[0];
+      if (!feature) return;
+      const train = this._trains.get(feature.properties.trip_id);
+      if (train) this._onClick(train);
+    });
+
+    this._map.on('mouseenter', 'trains', () => {
+      this._map.getCanvas().style.cursor = 'pointer';
+    });
+    this._map.on('mouseleave', 'trains', () => {
+      this._map.getCanvas().style.cursor = '';
+    });
 
     this._startLoop();
   }
 
+  onTrainClick(callback) { this._onClick = callback; }
+
+  /** Called with the full train set whenever the socket updates. */
   update(rows) {
     const now = Date.now() / 1000;
-    const ids = new Set(rows.map(r => r.trip_id));
-    for (const id of this._trains.keys()) {
-      if (!ids.has(id)) this._trains.delete(id);
-    }
+    const seen = new Set();
+
     for (const row of rows) {
-      if (this._trains.has(row.trip_id)) {
-        this._trains.get(row.trip_id).applyUpdate(row, now);
-      } else {
-        this._trains.set(row.trip_id, new TrainState(
-          row, now, this._shapeGeom, this._shapeIdx,
-          this._routeColors, this._stopCoords, this._shapePrefix,
-        ));
-      }
+      if (!row.trip_id) continue;
+      seen.add(row.trip_id);
+      const existing = this._trains.get(row.trip_id);
+      if (existing) existing.apply(row, now);
+      else this._trains.set(row.trip_id, new TrainState(row, now, this._context));
+    }
+
+    for (const tripId of this._trains.keys()) {
+      if (!seen.has(tripId)) this._trains.delete(tripId);
     }
   }
 
   setRouteVisible(routeId, visible) {
     if (visible) this._visibleRoutes.add(routeId);
-    else         this._visibleRoutes.delete(routeId);
-  }
-
-  onTrainClick(cb) { this._clickCb = cb; }
-
-  // ── Private ────────────────────────────────────────────────────────────────
-
-  _resize() {
-    const el = this._leaflet.getContainer();
-    this._canvas.width  = el.offsetWidth;
-    this._canvas.height = el.offsetHeight;
-  }
-
-  _radius() {
-    const z = this._leaflet.getZoom();
-    return z < 11 ? 5 : z < 13 ? 7 : z < 15 ? 9 : 11;
-  }
-
-  _render() {
-    const ctx = this._ctx;
-    const w   = this._canvas.width;
-    const h   = this._canvas.height;
-    ctx.clearRect(0, 0, w, h);
-
-    const now = Date.now() / 1000;
-    const r   = this._radius();
-
-    for (const [, state] of this._trains) {
-      if (!this._visibleRoutes.has(state.routeId)) continue;
-      const pos = state.interpolatedPosition(now);
-      if (!pos) continue;
-
-      // pos is [lon, lat]; L.latLng takes (lat, lon)
-      const pt = this._leaflet.latLngToContainerPoint(L.latLng(pos[1], pos[0]));
-
-      // Cull trains outside the visible canvas (saves draw calls)
-      if (pt.x < -r || pt.x > w + r || pt.y < -r || pt.y > h + r) continue;
-
-      ctx.beginPath();
-      ctx.arc(pt.x, pt.y, r, 0, Math.PI * 2);
-      ctx.fillStyle = state.color();
-      ctx.fill();
-      ctx.strokeStyle = '#fff';
-      ctx.lineWidth   = 1.5;
-      ctx.stroke();
-    }
+    else this._visibleRoutes.delete(routeId);
   }
 
   _startLoop() {
-    const FRAME_MS = 1000 / 30;
-    let lastMs = 0;
-    const tick = (ms) => {
-      if (this._trains.size > 0 && ms - lastMs >= FRAME_MS) {
-        this._render();
-        lastMs = ms;
-      }
-      this._rafId = requestAnimationFrame(tick);
+    const frame = timestamp => {
+      this._frameId = requestAnimationFrame(frame);
+      if (timestamp - this._lastFrame < FRAME_MS) return;
+      this._lastFrame = timestamp;
+      this._render();
     };
-    this._rafId = requestAnimationFrame(tick);
+    this._frameId = requestAnimationFrame(frame);
   }
 
-  _hitRadius() { return this._radius() + 5; }
+  _render() {
+    const source = this._map.getSource('trains');
+    if (!source) return;
 
-  _nearestTrain(containerPt, now) {
-    const hr = this._hitRadius();
-    const hr2 = hr * hr;
-    for (const [, state] of this._trains) {
-      if (!this._visibleRoutes.has(state.routeId)) continue;
-      const pos = state.interpolatedPosition(now);
-      if (!pos) continue;
-      const pt  = this._leaflet.latLngToContainerPoint(L.latLng(pos[1], pos[0]));
-      const dx  = containerPt.x - pt.x;
-      const dy  = containerPt.y - pt.y;
-      if (dx * dx + dy * dy <= hr2) return state;
+    const now = Date.now() / 1000;
+    const features = [];
+
+    for (const train of this._trains.values()) {
+      if (!this._visibleRoutes.has(train.route_id)) continue;
+      const position = train.positionAt(now);
+      if (!position) continue;
+      features.push({
+        type: 'Feature',
+        geometry: { type: 'Point', coordinates: position },
+        properties: {
+          trip_id: train.trip_id,
+          color:   train.color,
+          stalled: Boolean(train.is_stalled),
+        },
+      });
     }
-    return null;
+
+    source.setData({ type: 'FeatureCollection', features });
   }
 
-  _handleMapClick(e) {
-    if (!this._clickCb) return;
-    const now = Date.now() / 1000;
-    const pt  = this._leaflet.latLngToContainerPoint(e.latlng);
-    const hit = this._nearestTrain(pt, now);
-    // Station CircleMarker clicks stop propagation before reaching the map,
-    // so if we're here a train click takes priority with no extra action needed.
-    if (hit) this._clickCb(hit.toInfoObject());
-  }
-
-  _handleMouseMove(e) {
-    // Throttle to ~30fps — mousemove fires on every pixel, iterating 300 trains each time is wasteful
-    const ms = performance.now();
-    if (ms - (this._lastMouseMs || 0) < 32) return;
-    this._lastMouseMs = ms;
-
-    const now = Date.now() / 1000;
-    const pt  = this._leaflet.latLngToContainerPoint(e.latlng);
-    const hit = this._nearestTrain(pt, now);
-    this._leaflet.getContainer().style.cursor = hit ? 'pointer' : '';
+  destroy() {
+    if (this._frameId !== null) cancelAnimationFrame(this._frameId);
+    this._frameId = null;
   }
 }

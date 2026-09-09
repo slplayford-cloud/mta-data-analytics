@@ -204,7 +204,8 @@ class StaticDataCache:
 
         target_trips: set[str] = set(shape_to_trip.values())
 
-        trip_stops: dict[str, list[str]] = {}
+        # (stop_sequence, stop_id) so the list sorts into route order below.
+        trip_stops: dict[str, list[tuple[int, str]]] = {}
         with open(self._dir / "stop_times.txt", newline="") as f:
             for row in csv.DictReader(f):
                 tid = row.get("trip_id", "").strip()

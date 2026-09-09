@@ -1,200 +1,336 @@
 #!/usr/bin/env python3
 """
-MTA real-time ingestion — tracks expected vs actual arrivals per station.
-Only tracks trips from their origin. Mid-trip trains are ignored.
+Turn the realtime feed into a record of what actually happened.
 
-Run: python -m src.ingestion
+The feed never says "this train departed". It publishes the stops a train has
+left to make, and that list shrinks. A stop disappearing between two polls means
+the train has just left it, and the last arrival time predicted for that stop is
+the closest thing to an observed arrival the feed offers.
+
+Each departure is measured three ways, because no single number is honest for
+every trip:
+
+  runtime_deviation    how much longer the train took between the last two stops
+                       than the schedule allows. Defined for every trip we can
+                       resolve to a pattern, so it is the comparable metric.
+  delay_vs_schedule    minutes late against the published timetable. Only
+                       meaningful for trips found in the timetable.
+  delay_vs_prediction  how far the MTA's own prediction moved. Measures forecast
+                       error, not lateness.
 """
 
-import os
-import time
-import logging
-from datetime import datetime
-from typing import Any
+from __future__ import annotations
 
-from supabase import create_client, Client
-from nyct_gtfs import NYCTFeed
-from nyct_gtfs.trip import Trip
+import logging
+from dataclasses import dataclass, field
+from datetime import date, datetime
+from typing import Protocol, Sequence
+
+from src.schedule import Resolution
 
 log = logging.getLogger(__name__)
 
-POLL_INTERVAL = 30  # seconds
+# nyct-gtfs returns the epoch for unset protobuf timestamps rather than None.
+_MIN_VALID = datetime(2000, 1, 1)
 
-_MIN_VALID_DT = datetime(2000, 1, 1)
-
-def _stu_time(t: datetime | None) -> datetime | None:
-    """Return t only if it's a real timestamp; nyct-gtfs returns epoch (1970) for unset fields."""
-    return t if (t is not None and t > _MIN_VALID_DT) else None
-
-# ── in-memory state ───────────────────────────────────────────────────────────
-
-# trip_id → {stop_id → (scheduled_arrival, stop_sequence)}
-# Only populated for trips captured before departure — i + 1 is accurate
-# when stop_time_updates contains the full route (train not yet underway).
-_schedules: dict[str, dict[str, tuple[datetime, int]]] = {}
-
-# trip_id → {stop_id → (predicted_arrival, stop_name)}
-# Rebuilt every poll. A stop disappearing = train departed that stop.
-_last_predictions: dict[str, dict[str, tuple[datetime | None, str | None]]] = {}
-
-# ── supabase ──────────────────────────────────────────────────────────────────
-
-def get_client() -> Client:
-    return create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
+# The NYCT spec: if a vehicle timestamp is more than this far behind the feed
+# header, the train is not moving and countdown clocks should stop.
+STALL_THRESHOLD_SECONDS = 90
 
 
+def stu_time(value: datetime | None) -> datetime | None:
+    """Reject the epoch placeholder nyct-gtfs uses for unset fields."""
+    return value if value is not None and value > _MIN_VALID else None
 
-def snapshot_schedule(db: Client, trip: Trip) -> None:
+
+def arrival_of(update: StopUpdate) -> datetime | None:
+    return stu_time(update.arrival) or stu_time(update.departure)
+
+
+def parent_station(stop_id: str) -> str:
+    """Strip the N/S platform suffix: "109N" -> "109"."""
+    return stop_id[:-1] if stop_id and stop_id[-1] in "NSEW" else stop_id
+
+
+class StopUpdate(Protocol):
+    """The part of a GTFS-RT stop_time_update this module reads."""
+
+    # Read-only members, so a supplier with a narrower type still satisfies this.
+    @property
+    def stop_id(self) -> str: ...
+    @property
+    def arrival(self) -> datetime | None: ...
+    @property
+    def departure(self) -> datetime | None: ...
+
+
+class FeedTrip(Protocol):
+    """The part of a nyct-gtfs Trip this module reads.
+
+    Declared structurally rather than importing the concrete class, so departure
+    detection can be tested without constructing protobuf messages.
     """
-    Capture the full route as the schedule baseline.
-    Only called when trip.underway is False — at that point stop_time_updates
-    contains every stop on the route, so i + 1 is the correct sequence.
-    """
-    stops: list[dict[str, Any]] = []
-    sched: dict[str, tuple[datetime, int]] = {}
-    for i, stu in enumerate(trip.stop_time_updates):
-        t: datetime | None = _stu_time(stu.arrival) or _stu_time(stu.departure)
-        seq: int = i + 1
-        stops.append({
-            "stop_id":   stu.stop_id,
-            "seq":       seq,
-            "stop_name": stu.stop_name,
-            "sched_arr": t.isoformat() if t else None,
-        })
-        if t:
-            sched[stu.stop_id] = (t, seq)
 
-    if not stops:
-        return
-
-    # Set in-memory cache before the DB write so a write failure
-    # doesn't cause an infinite retry loop on the next poll.
-    _schedules[trip.trip_id] = sched
-
-    db.table("trip_schedules").upsert({
-        "trip_id":    trip.trip_id,
-        "start_date": trip.start_date.isoformat(),
-        "route_id":   trip.route_id,
-        "direction":  trip.direction,
-        "shape_id":   trip.shape_id,
-        "stops":      stops,
-    }, ignore_duplicates=True).execute()
-
-    log.debug(f"Snapshotted {trip.trip_id} ({len(stops)} stops)")
+    @property
+    def trip_id(self) -> str: ...
+    @property
+    def route_id(self) -> str: ...
+    @property
+    def direction(self) -> str | None: ...
+    @property
+    def headsign_text(self) -> str | None: ...
+    @property
+    def shape_id(self) -> str | None: ...
+    @property
+    def stop_time_updates(self) -> Sequence[StopUpdate]: ...
 
 
-def record_stop_visit(
-    db: Client,
-    trip: Trip,
-    stop_id: str,
-    predicted_arrival: datetime | None,
-    stop_name: str | None,
-) -> None:
-    """Write a completed stop visit. delay_seconds = actual - scheduled."""
-    entry: tuple[datetime, int] | None = _schedules.get(trip.trip_id, {}).get(stop_id)
-    scheduled: datetime | None = entry[0] if entry else None
-    stop_sequence: int | None = entry[1] if entry else None
+class ScheduleResolver(Protocol):
+    """The single method Ingestor needs from ScheduleIndex."""
 
-    delay_seconds: int | None = None
-    if scheduled and predicted_arrival:
-        delay_seconds = int((predicted_arrival - scheduled).total_seconds())
-
-    db.table("stop_visits").insert({
-        "trip_id":           trip.trip_id,
-        "start_date":        trip.start_date.isoformat(),
-        "route_id":          trip.route_id,
-        "direction":         trip.direction,
-        "stop_id":           stop_id,
-        "parent_station":    stop_id[:-1],  # strip N/S suffix
-        "stop_name":         stop_name,
-        "stop_sequence":     stop_sequence,
-        "scheduled_arrival": scheduled.isoformat() if scheduled else None,
-        "actual_arrival":    predicted_arrival.isoformat() if predicted_arrival else None,
-        "delay_seconds":     delay_seconds,
-    }).execute()
-
-    log.debug(
-        f"{trip.route_id} {trip.direction} | {stop_name or stop_id} | "
-        f"seq={stop_sequence} delay={delay_seconds}s"
-    )
+    def resolve(
+        self,
+        route_id: str,
+        trip_id: str,
+        observed_stops: tuple[str, ...],
+        service_date: date,
+    ) -> Resolution: ...
 
 
-# ── poll ──────────────────────────────────────────────────────────────────────
+@dataclass
+class StopVisit:
+    """One observed departure, ready to write."""
 
-def poll(db: Client, feeds: list[NYCTFeed]) -> None:
-    all_trips: list[Trip] = []
-    for feed in feeds:
-        feed.refresh()
-        all_trips.extend(feed.filter_trips(train_assigned=True))
-    active_ids: set[str] = {t.trip_id for t in all_trips}
+    service_date: date
+    trip_id: str
+    stop_id: str
+    parent_station: str
+    stop_sequence: int | None
+    scheduled_arrival: datetime | None
+    predicted_arrival: datetime | None
+    actual_arrival: datetime | None
+    runtime_deviation: int | None
+    delay_vs_schedule: int | None
+    delay_vs_prediction: int | None
+    actual_track: str | None
 
-    for trip in all_trips:
-        trip_id: str = trip.trip_id
-
-        if trip_id not in _schedules:
-            snapshot_schedule(db, trip)
-
-        if not trip.underway:
-            continue
-
-        # Build current predictions for remaining stops
-        current: dict[str, tuple[datetime | None, str | None]] = {
-            stu.stop_id: (_stu_time(stu.arrival) or _stu_time(stu.departure), stu.stop_name)
-            for stu in trip.stop_time_updates
+    def as_row(self) -> dict:
+        return {
+            "service_date": self.service_date.isoformat(),
+            "trip_id": self.trip_id,
+            "stop_id": self.stop_id,
+            "parent_station": self.parent_station,
+            "stop_sequence": self.stop_sequence,
+            "scheduled_arrival": _iso(self.scheduled_arrival),
+            "predicted_arrival": _iso(self.predicted_arrival),
+            "actual_arrival": _iso(self.actual_arrival),
+            "runtime_deviation": self.runtime_deviation,
+            "delay_vs_schedule": self.delay_vs_schedule,
+            "delay_vs_prediction": self.delay_vs_prediction,
+            "actual_track": self.actual_track,
         }
 
-        # Any stop in last poll but not this one → train just departed it
-        if trip_id in _last_predictions:
-            for stop_id, (pred_arr, stop_name) in _last_predictions[trip_id].items():
-                if stop_id not in current:
-                    record_stop_visit(db, trip, stop_id, pred_arr, stop_name)
 
-        _last_predictions[trip_id] = current
-
-    # Clean up trips that have left the feed (completed or cancelled)
-    for trip_id in list(_last_predictions):
-        if trip_id not in active_ids:
-            del _last_predictions[trip_id]
-
-    for trip_id in list(_schedules):
-        if trip_id not in active_ids:
-            db.table("trip_schedules") \
-              .update({"is_active": False}) \
-              .eq("trip_id", trip_id) \
-              .execute()
-            del _schedules[trip_id]
-
-    pre_dep: int = sum(1 for t in all_trips if t.trip_id in _schedules and not t.underway)
-    skipped: int = sum(1 for t in all_trips if t.trip_id not in _schedules and t.underway)
-    log.warning(
-        f"Active: {len(active_ids)} | "
-        f"Pre-departure: {pre_dep} | "
-        f"Tracking: {len(_last_predictions)} | "
-        f"Skipped (joined mid-trip): {skipped}"
-    )
+def _iso(value: datetime | None) -> str | None:
+    return value.isoformat() if value else None
 
 
-# ── entry point ───────────────────────────────────────────────────────────────
+@dataclass
+class TrackedTrip:
+    """Everything we remember about one trip between polls."""
 
-def main() -> None:
-    logging.basicConfig(
-        level=logging.WARNING,
-        format="%(asctime)s  %(levelname)s  %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    trip_id: str
+    service_date: date
+    route_id: str
+    direction: str | None
+    headsign: str | None
+    shape_id: str | None
+    nyc_train_id: str | None
+    resolution: Resolution
 
-    FEED_LINES: list[str] = ["1", "N"]
+    # The feed's own prediction for each stop, captured the first time we saw
+    # the trip. Comparing against this measures MTA forecast error.
+    predictions_at_start: dict[str, datetime] = field(default_factory=dict)
+    # Stops still ahead of the train as of the previous poll.
+    remaining: dict[str, datetime | None] = field(default_factory=dict)
+    # Where the train was last seen departing, to measure the next segment.
+    last_departure: tuple[str, datetime] | None = None
+    recorded: set[str] = field(default_factory=set)
 
-    db: Client = get_client()
-    feeds: list[NYCTFeed] = [NYCTFeed(line, fetch_immediately=False) for line in FEED_LINES]
+    def sequence_of(self, stop_id: str) -> int | None:
+        for stop in self.resolution.stops:
+            if stop.stop_id == stop_id:
+                return stop.sequence
+        return None
 
-    while True:
-        try:
-            poll(db, feeds)
-        except Exception:
-            log.exception("Poll failed")
-        time.sleep(POLL_INTERVAL)
+    def as_row(self) -> dict:
+        return {
+            "trip_id": self.trip_id,
+            "service_date": self.service_date.isoformat(),
+            "route_id": self.route_id,
+            "direction": self.direction,
+            "headsign": self.headsign,
+            "shape_id": self.shape_id,
+            "nyc_train_id": self.nyc_train_id,
+            "baseline": self.resolution.tier,
+            "is_supplemental": self.resolution.is_supplemental,
+            "scheduled_stops": [
+                {
+                    "stop_id": stop.stop_id,
+                    "seq": stop.sequence,
+                    "sched_arr": stop.arrival_seconds,
+                }
+                for stop in self.resolution.stops
+            ],
+        }
 
 
-if __name__ == "__main__":
-    main()
+class Ingestor:
+    """Tracks live trips and emits a StopVisit for each observed departure.
+
+    Holds no database handle. Callers poll `observe()` with the current feed
+    contents and write whatever it returns.
+    """
+
+    def __init__(self, schedule: ScheduleResolver) -> None:
+        self._schedule = schedule
+        self._trips: dict[str, TrackedTrip] = {}
+
+    @property
+    def tracked(self) -> dict[str, TrackedTrip]:
+        return self._trips
+
+    def observe(
+        self, trips: Sequence[FeedTrip], service_date: date
+    ) -> tuple[list[TrackedTrip], list[StopVisit]]:
+        """Fold one poll's worth of feed data in.
+
+        Returns the trips seen for the first time and the departures detected
+        since the previous call.
+        """
+        new_trips: list[TrackedTrip] = []
+        visits: list[StopVisit] = []
+
+        for trip in trips:
+            tracked = self._trips.get(trip.trip_id)
+            if tracked is None:
+                tracked = self._begin(trip, service_date)
+                self._trips[trip.trip_id] = tracked
+                new_trips.append(tracked)
+
+            visits.extend(self._detect_departures(trip, tracked))
+
+        self._drop_finished({trip.trip_id for trip in trips})
+        return new_trips, visits
+
+    def _begin(self, trip: FeedTrip, service_date: date) -> TrackedTrip:
+        stops = tuple(update.stop_id for update in trip.stop_time_updates)
+        resolution = self._schedule.resolve(
+            trip.route_id, trip.trip_id, stops, service_date
+        )
+        predictions = {
+            update.stop_id: arrival
+            for update in trip.stop_time_updates
+            if (arrival := arrival_of(update)) is not None
+        }
+        return TrackedTrip(
+            trip_id=trip.trip_id,
+            service_date=service_date,
+            route_id=trip.route_id,
+            direction=trip.direction,
+            headsign=trip.headsign_text,
+            shape_id=trip.shape_id,
+            nyc_train_id=_safe(trip, "nyc_train_id"),
+            resolution=resolution,
+            predictions_at_start=predictions,
+        )
+
+    def _detect_departures(
+        self, trip: FeedTrip, tracked: TrackedTrip
+    ) -> list[StopVisit]:
+        """A stop that vanished from the remaining list has just been departed."""
+        current = {
+            update.stop_id: arrival_of(update)
+            for update in trip.stop_time_updates
+        }
+        tracks = {
+            update.stop_id: _safe(update, "actual_track")
+            for update in trip.stop_time_updates
+        }
+
+        visits: list[StopVisit] = []
+        for stop_id, predicted_now in tracked.remaining.items():
+            if stop_id in current or stop_id in tracked.recorded:
+                continue
+            visit = self._record(tracked, stop_id, predicted_now, tracks.get(stop_id))
+            if visit is not None:
+                visits.append(visit)
+                tracked.recorded.add(stop_id)
+                if visit.actual_arrival is not None:
+                    tracked.last_departure = (stop_id, visit.actual_arrival)
+
+        tracked.remaining = current
+        return visits
+
+    def _record(
+        self,
+        tracked: TrackedTrip,
+        stop_id: str,
+        actual: datetime | None,
+        track: str | None,
+    ) -> StopVisit | None:
+        resolution = tracked.resolution
+        scheduled = resolution.scheduled_arrival(stop_id, tracked.service_date)
+        predicted = tracked.predictions_at_start.get(stop_id)
+
+        delay_vs_schedule = _delta(actual, scheduled)
+        delay_vs_prediction = _delta(actual, predicted)
+        runtime_deviation = self._runtime_deviation(tracked, stop_id, actual)
+
+        return StopVisit(
+            service_date=tracked.service_date,
+            trip_id=tracked.trip_id,
+            stop_id=stop_id,
+            parent_station=parent_station(stop_id),
+            stop_sequence=tracked.sequence_of(stop_id),
+            scheduled_arrival=scheduled,
+            predicted_arrival=predicted,
+            actual_arrival=actual,
+            runtime_deviation=runtime_deviation,
+            delay_vs_schedule=delay_vs_schedule,
+            delay_vs_prediction=delay_vs_prediction,
+            actual_track=track,
+        )
+
+    @staticmethod
+    def _runtime_deviation(
+        tracked: TrackedTrip, stop_id: str, actual: datetime | None
+    ) -> int | None:
+        """How much longer this segment took than the schedule allows for it."""
+        if actual is None or tracked.last_departure is None:
+            return None
+        previous_stop, previous_time = tracked.last_departure
+        baseline = tracked.resolution.baseline_runtime(previous_stop, stop_id)
+        if baseline is None:
+            return None
+        observed = (actual - previous_time).total_seconds()
+        return int(observed - baseline)
+
+    def _drop_finished(self, active_ids: set[str]) -> None:
+        for trip_id in list(self._trips):
+            if trip_id not in active_ids:
+                del self._trips[trip_id]
+
+
+def _delta(actual: datetime | None, reference: datetime | None) -> int | None:
+    if actual is None or reference is None:
+        return None
+    return int((actual - reference).total_seconds())
+
+
+def _safe(obj, attribute: str):
+    """Read an optional nyct-gtfs property that raises when the field is absent."""
+    try:
+        return getattr(obj, attribute)
+    except Exception:
+        return None

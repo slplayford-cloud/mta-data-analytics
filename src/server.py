@@ -1,173 +1,201 @@
 #!/usr/bin/env python3
 """
-FastAPI server — serves pre-built static GeoJSON from the StaticDataCache,
-streams live train positions over WebSocket, and answers station arrival
-queries from in-memory state (no Supabase round-trip per click).
+FastAPI server.
+
+Serves pre-built static GeoJSON, streams train positions over WebSocket, and
+answers station queries from memory. The poller runs as a task on this server's
+own event loop, so there is no thread bridge.
 
 Run:  python run_server.py
 """
 
+from __future__ import annotations
+
 import asyncio
 import logging
-import os
-import threading
 from contextlib import asynccontextmanager
+from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 from typing import cast
+
+import orjson
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import Response
+from fastapi.routing import APIRouter
+from fastapi.staticfiles import StaticFiles
+from starlette.middleware.gzip import GZipMiddleware
+from supabase import create_client
+
+from src.cache import StaticDataCache
+from src.config import config
+from src.poller import Poller, TrainPosition
+from src.schedule import ScheduleIndex
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
     datefmt="%H:%M:%S",
 )
+log = logging.getLogger(__name__)
 
-import orjson
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import Response
-from fastapi.staticfiles import StaticFiles
-from fastapi.routing import APIRouter
-from starlette.middleware.gzip import GZipMiddleware
-from supabase import create_client, Client
+STATIC_CACHE = "public, max-age=3600, immutable"
+NO_CACHE = "no-cache, no-store"
 
-from src.cache import StaticDataCache
-from src.poller import Poller
-
-# ── Singletons ────────────────────────────────────────────────────────────────
-
-_cache: StaticDataCache | None = None
-_db: Client | None = None
-_poller: Poller | None = None
-_ws_manager: "WebSocketManager | None" = None
-_stop_info_bytes: bytes | None = None
-_stop_info_map: dict[str, dict] = {}  # stop_id → {name, lat, lon, ...}
-
-# 1-hour cache header for immutable static GTFS data
-_STATIC_CACHE = "public, max-age=3600, immutable"
-# No cache for live data
-_NO_CACHE = "no-cache, no-store"
+# Fields that never change for a trip. Sent once in the snapshot, omitted from
+# every later delta.
+_STATIC_FIELDS = frozenset(
+    {"route_id", "direction", "headsign", "shape_id", "nyc_train_id"}
+)
 
 
-# ── WebSocket manager ─────────────────────────────────────────────────────────
+class TrainStream:
+    """Holds the live train set and pushes deltas to connected clients.
 
-class WebSocketManager:
-    """Thread-safe manager for connected WebSocket clients."""
+    New clients get one full snapshot; everyone else gets only what changed.
+    With ~800 trains and a 15s cycle that is the difference between resending
+    the world every poll and sending the handful of trains that actually moved.
+    """
 
     def __init__(self) -> None:
-        self._connections: set[WebSocket] = set()
-        self._last_payload: bytes | None = None
-        self._last_trains: list[dict] = []  # in-memory snapshot for arrivals queries
-
-    async def connect(self, ws: WebSocket) -> None:
-        await ws.accept()
-        self._connections.add(ws)
-        if self._last_payload:
-            try:
-                await ws.send_bytes(self._last_payload)
-            except Exception:
-                pass
-
-    def disconnect(self, ws: WebSocket) -> None:
-        self._connections.discard(ws)
+        self._clients: set[WebSocket] = set()
+        self._trains: dict[str, dict] = {}
+        self._snapshot: bytes = b""
 
     @property
-    def last_trains(self) -> list[dict]:
-        return self._last_trains
+    def trains(self) -> list[dict]:
+        return list(self._trains.values())
 
-    async def broadcast(self, payload: bytes, trains: list[dict]) -> None:
-        self._last_payload = payload
-        self._last_trains = trains
-        dead: list[WebSocket] = []
-        for ws in list(self._connections):
+    async def connect(self, websocket: WebSocket) -> None:
+        await websocket.accept()
+        self._clients.add(websocket)
+        if self._snapshot:
             try:
-                await ws.send_bytes(payload)
+                await websocket.send_bytes(self._snapshot)
             except Exception:
-                dead.append(ws)
-        for ws in dead:
-            self._connections.discard(ws)
+                self._clients.discard(websocket)
 
-    def schedule_broadcast(self, payload: bytes, trains: list[dict], loop: asyncio.AbstractEventLoop) -> None:
-        asyncio.run_coroutine_threadsafe(self.broadcast(payload, trains), loop)
+    def disconnect(self, websocket: WebSocket) -> None:
+        self._clients.discard(websocket)
+
+    def publish(self, positions: list[TrainPosition], now: datetime) -> None:
+        """Diff against the previous cycle and broadcast the change."""
+        incoming = {position.trip_id: asdict(position) for position in positions}
+
+        upserts: list[dict] = []
+        for trip_id, train in incoming.items():
+            previous = self._trains.get(trip_id)
+            if previous is None:
+                upserts.append(train)
+                continue
+            changed = {
+                key: value for key, value in train.items()
+                if key not in _STATIC_FIELDS and previous.get(key) != value
+            }
+            if changed:
+                changed["trip_id"] = trip_id
+                upserts.append(changed)
+
+        removed = [trip_id for trip_id in self._trains if trip_id not in incoming]
+
+        self._trains = incoming
+        self._snapshot = orjson.dumps({
+            "type": "snapshot",
+            "ts": now.timestamp(),
+            "trains": list(incoming.values()),
+        })
+
+        if not upserts and not removed:
+            return
+
+        payload = orjson.dumps({
+            "type": "delta",
+            "ts": now.timestamp(),
+            "upsert": upserts,
+            "remove": removed,
+        })
+        asyncio.get_running_loop().create_task(self._broadcast(payload))
+
+    async def _broadcast(self, payload: bytes) -> None:
+        dead = []
+        for websocket in list(self._clients):
+            try:
+                await websocket.send_bytes(payload)
+            except Exception:
+                dead.append(websocket)
+        for websocket in dead:
+            self._clients.discard(websocket)
 
 
-# ── Singleton accessors ────────────────────────────────────────────────────────
-# The globals above are populated in lifespan() before any request is served, but
-# the type checker can't prove that. These accessors narrow `X | None` → `X` (and
-# fail loudly if ever called before startup) so endpoints stay type-clean.
+cache: StaticDataCache
+stream: TrainStream
+stop_info: dict[str, dict] = {}
+_stop_info_bytes: bytes = b"{}"
 
-def cache() -> StaticDataCache:
-    assert _cache is not None, "StaticDataCache accessed before startup"
-    return _cache
-
-
-def ws() -> "WebSocketManager":
-    assert _ws_manager is not None, "WebSocketManager accessed before startup"
-    return _ws_manager
-
-
-# ── Lifespan ──────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    global _cache, _db, _poller, _ws_manager, _stop_info_bytes
+    global cache, stream, _stop_info_bytes
 
-    _db = create_client(
-        os.environ["SUPABASE_URL"],
-        os.environ["SUPABASE_SERVICE_KEY"],
+    db = create_client(config.supabase_url, config.supabase_service_key)
+
+    cache = StaticDataCache(config.static_dir)
+    cache.build()
+
+    schedule = ScheduleIndex(config.static_dir)
+    schedule.build()
+
+    _stop_info_bytes = _load_stop_info(db)
+    stream = TrainStream()
+
+    poller = Poller(
+        db, schedule,
+        interval=config.poll_interval,
+        on_positions=stream.publish,
     )
-
-
-    _cache = StaticDataCache()
-    _cache.build()
-
-    # Load stop_info once at startup — static GTFS data, no per-request DB hit.
-    # PostgREST caps a single response at 1000 rows; stop_info has ~1488, so we
-    # page through with .range() until a short page signals the end. Without this
-    # everything alphabetically after "G20" (incl. all L-line stops) is dropped,
-    # which is what made station_name come back null for e.g. L06.
-    try:
-        _PAGE = 1000
-        offset = 0
-        while True:
-            page = (
-                _db.table("stop_info")
-                .select("stop_id,stop_name,stop_lat,stop_lon,location_type,parent_station")
-                .range(offset, offset + _PAGE - 1)
-                .execute()
-            )
-            # postgrest types .data as a loose JSON value; we know each row is a dict
-            rows = cast(list[dict], page.data)
-            for row in rows:
-                _stop_info_map[row["stop_id"]] = {
-                    "name":   row["stop_name"],
-                    "lat":    row["stop_lat"],
-                    "lon":    row["stop_lon"],
-                    "type":   row["location_type"],
-                    "parent": row["parent_station"],
-                }
-            if len(rows) < _PAGE:
-                break
-            offset += _PAGE
-        _stop_info_bytes = orjson.dumps(_stop_info_map)
-        logging.getLogger(__name__).info("stop_info loaded: %d stops", len(_stop_info_map))
-    except Exception as e:
-        logging.getLogger(__name__).warning("stop_info load failed: %s", e)
-        _stop_info_bytes = orjson.dumps({})
-
-    _ws_manager = WebSocketManager()
-
-    loop = asyncio.get_running_loop()
-    _poller = Poller(
-        _db,
-        ws_broadcast=lambda p, rows: ws().schedule_broadcast(p, rows, loop),
-    )
-    t = threading.Thread(target=_poller.run, daemon=True, name="gtfs-poller")
-    t.start()
+    task = asyncio.create_task(poller.run())
 
     yield
 
-    if _poller:
-        _poller.stop()
-        t.join(timeout=5)
+    poller.stop()
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+def _load_stop_info(db) -> bytes:
+    """Page through stop_info once at startup.
+
+    PostgREST caps a response at 1000 rows and the table has ~1488, so a single
+    select silently drops everything after "G20" -- which is what used to make
+    station names come back null for the whole L line.
+    """
+    page_size = 1000
+    offset = 0
+    try:
+        while True:
+            page = (
+                db.table("stop_info")
+                .select("stop_id,stop_name,stop_lat,stop_lon,location_type,parent_station")
+                .range(offset, offset + page_size - 1)
+                .execute()
+            )
+            rows = cast(list[dict], page.data)
+            for row in rows:
+                stop_info[row["stop_id"]] = {
+                    "name": row["stop_name"],
+                    "lat": row["stop_lat"],
+                    "lon": row["stop_lon"],
+                }
+            if len(rows) < page_size:
+                break
+            offset += page_size
+        log.info("stop_info loaded: %d stops", len(stop_info))
+    except Exception as exc:
+        log.warning("stop_info load failed: %s", exc)
+    return orjson.dumps(stop_info)
 
 
 app = FastAPI(lifespan=lifespan, title="MTA Subway Map API")
@@ -175,136 +203,85 @@ app.add_middleware(GZipMiddleware, minimum_size=1024)
 router = APIRouter(prefix="/api")
 
 
-# ── REST endpoints ─────────────────────────────────────────────────────────────
+def _json(content: bytes, cache_control: str = STATIC_CACHE) -> Response:
+    return Response(content=content, media_type="application/json",
+                    headers={"Cache-Control": cache_control})
+
+
+@router.get("/config")
+async def get_config() -> Response:
+    """Browser-safe settings. The Mapbox token here must be a public pk. token."""
+    return _json(orjson.dumps({"mapboxToken": config.mapbox_token}), NO_CACHE)
+
 
 @router.get("/stations")
 async def get_stations() -> Response:
-    return Response(
-        content=cache().stations_geojson,
-        media_type="application/json",
-        headers={"Cache-Control": _STATIC_CACHE},
-    )
+    return _json(cache.stations_geojson)
 
 
 @router.get("/routes")
 async def get_routes() -> Response:
-    return Response(
-        content=orjson.dumps(cache().routes_meta),
-        media_type="application/json",
-        headers={"Cache-Control": _STATIC_CACHE},
-    )
-
-
-@router.get("/shapes/{route_id}")
-async def get_shapes(route_id: str) -> Response:
-    data = cache().get_shapes_geojson(route_id)
-    if data is None:
-        raise HTTPException(status_code=404, detail=f"No shapes for route {route_id!r}")
-    return Response(
-        content=data,
-        media_type="application/json",
-        headers={"Cache-Control": _STATIC_CACHE},
-    )
+    return _json(orjson.dumps(cache.routes_meta))
 
 
 @router.get("/all-shapes")
 async def get_all_shapes() -> Response:
-    """All route shapes in one request — eliminates 28 separate fetches at page load."""
-    return Response(
-        content=cache().all_shapes_bytes,
-        media_type="application/json",
-        headers={"Cache-Control": _STATIC_CACHE},
-    )
+    return _json(cache.all_shapes_bytes)
 
 
 @router.get("/shape-index")
 async def get_shape_index() -> Response:
-    return Response(
-        content=cache().shape_index_bytes,
-        media_type="application/json",
-        headers={"Cache-Control": _STATIC_CACHE},
-    )
+    return _json(cache.shape_index_bytes)
 
 
 @router.get("/stop-info")
 async def get_stop_info() -> Response:
-    """All stops from Supabase stop_info table, keyed by stop_id. Cached 1h."""
-    return Response(
-        content=_stop_info_bytes,
-        media_type="application/json",
-        headers={"Cache-Control": _STATIC_CACHE},
-    )
+    return _json(_stop_info_bytes)
 
 
 @router.get("/station/{station_id}/arrivals")
 async def get_station_arrivals(station_id: str) -> Response:
-    """
-    Answers from in-memory train state — no Supabase round-trip.
-    loc_station is parent station id; next_stop is platform-level (e.g. "110N").
-    """
-    trains = _ws_manager.last_trains if _ws_manager else []
+    """Answered from the in-memory train set, so no database round trip."""
     arrivals = [
-        t for t in trains
-        if t.get("loc_station") == station_id
-        or (t.get("next_stop") or "").startswith(station_id)
+        train for train in stream.trains
+        if train.get("loc_station") == station_id
+        or (train.get("next_stop") or "").startswith(station_id)
     ]
-    arrivals.sort(key=lambda t: t.get("next_arr") or "")
+    arrivals.sort(key=lambda train: train.get("next_arr") or "")
 
-    # Resolve station name server-side so the client always gets it
-    station_name: str | None = None
-    if station_info := _stop_info_map.get(station_id):
-        station_name = station_info.get("name")
-
-    return Response(
-        content=orjson.dumps({
-            "station_id":   station_id,
-            "station_name": station_name,
-            "arrivals":     arrivals[:12],
-        }),
-        media_type="application/json",
-        headers={"Cache-Control": _NO_CACHE},
-    )
+    info = stop_info.get(station_id)
+    return _json(orjson.dumps({
+        "station_id": station_id,
+        "station_name": info.get("name") if info else None,
+        "arrivals": arrivals[:12],
+    }), NO_CACHE)
 
 
 @router.get("/train/{trip_id}")
-async def get_train_detail(trip_id: str) -> Response:
-    trains = _ws_manager.last_trains if _ws_manager else []
-    match = next((t for t in trains if t.get("trip_id") == trip_id), None)
-    if not match:
-        raise HTTPException(status_code=404, detail="Train not found")
-    return Response(
-        content=orjson.dumps(match),
-        media_type="application/json",
-        headers={"Cache-Control": _NO_CACHE},
-    )
+async def get_train(trip_id: str) -> Response:
+    for train in stream.trains:
+        if train.get("trip_id") == trip_id:
+            return _json(orjson.dumps(train), NO_CACHE)
+    raise HTTPException(status_code=404, detail="Train not found")
 
-
-# ── WebSocket ──────────────────────────────────────────────────────────────────
 
 @router.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    manager = ws()
-    await manager.connect(websocket)
+async def websocket_endpoint(websocket: WebSocket) -> None:
+    await stream.connect(websocket)
     try:
         while True:
             await websocket.receive_bytes()
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
+        stream.disconnect(websocket)
     except Exception:
-        manager.disconnect(websocket)
-
-
-# ── Mount ──────────────────────────────────────────────────────────────────────
+        stream.disconnect(websocket)
 
 
 class NoCacheStaticFiles(StaticFiles):
-    """Serve web assets with `no-cache` so browsers always revalidate.
+    """Serve web assets with no-cache so a deploy cannot strand users on old modules.
 
-    ES module imports (app.js → ./MapManager.js, …) are fetched directly by the
-    browser and would otherwise be cached aggressively, leaving users on stale
-    code after a deploy. `no-cache` forces a conditional request; unchanged files
-    still return a fast 304 (StaticFiles sends an ETag), so the cost is one
-    round-trip, not a full re-download.
+    ES module imports are fetched directly by the browser and would otherwise be
+    cached hard. Unchanged files still return a fast 304.
     """
 
     async def get_response(self, path: str, scope):

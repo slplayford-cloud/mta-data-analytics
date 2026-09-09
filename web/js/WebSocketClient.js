@@ -1,68 +1,77 @@
 /**
- * WebSocketClient — connects to /api/ws and maintains full train state.
- * Exponential backoff reconnect; calls onTrains() with the full train array
- * after every update.
+ * WebSocketClient — keeps a live train set in sync with the server.
+ *
+ * The server sends one full snapshot on connect, then deltas. A delta carries
+ * only the fields that changed, plus trip_id, so updates are merged into the
+ * existing record rather than replacing it. Fields that never change for a trip
+ * (route, headsign, shape) arrive once in the snapshot and are never resent.
  */
 
-// One decoder reused across all frames — constructing a TextDecoder per message
-// allocates needlessly on every broadcast.
-const _decoder = new TextDecoder();
+const decoder = new TextDecoder();
 
 export class WebSocketClient {
   constructor(path = '/api/ws') {
-    this._path    = path;
-    this._ws      = null;
-    this._cb      = null;
-    this._cache   = new Map();  // trip_id → row (full snapshot per broadcast)
-    this._backoff = 1000;       // ms; doubles on each failed connect
-    this._intentionalClose = false;
+    this._path     = path;
+    this._socket   = null;
+    this._trains   = new Map();   // trip_id → full train record
+    this._onTrains = () => {};
+    this._backoff  = 1000;
+    this._closing  = false;
   }
 
-  onTrains(cb) { this._cb = cb; }
+  onTrains(callback) { this._onTrains = callback; }
 
   connect() {
-    this._intentionalClose = false;
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const url   = `${proto}//${location.host}${this._path}`;
+    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    this._socket = new WebSocket(`${protocol}//${location.host}${this._path}`);
+    this._socket.binaryType = 'arraybuffer';
 
-    this._ws = new WebSocket(url);
-    this._ws.binaryType = 'arraybuffer';
+    this._socket.onopen = () => { this._backoff = 1000; };
 
-    this._ws.onopen = () => {
-      console.log('[WS] connected');
-      this._backoff = 1000;
-    };
-
-    this._ws.onmessage = e => {
+    this._socket.onmessage = event => {
+      let message;
       try {
-        const msg = JSON.parse(_decoder.decode(e.data));
-        if (msg.type === 'trains') {
-          // Full state snapshot — replace cache entirely
-          this._cache.clear();
-          for (const t of msg.trains) this._cache.set(t.trip_id, t);
-          if (this._cb) this._cb([...this._cache.values()]);
-          console.log(`[WS] ${msg.trains.length} trains at ${new Date(msg.ts * 1000).toLocaleTimeString()}`);
-        }
-      } catch (err) {
-        console.warn('[WS] parse error:', err);
+        const text = typeof event.data === 'string'
+          ? event.data
+          : decoder.decode(event.data);
+        message = JSON.parse(text);
+      } catch {
+        return;   // a malformed frame should not kill the stream
       }
+
+      if (message.type === 'snapshot')   this._applySnapshot(message);
+      else if (message.type === 'delta') this._applyDelta(message);
+      else return;
+
+      this._onTrains([...this._trains.values()]);
     };
 
-    this._ws.onclose = () => {
-      if (!this._intentionalClose) {
-        console.log(`[WS] disconnected — reconnecting in ${this._backoff / 1000}s`);
-        setTimeout(() => this.connect(), this._backoff);
-        this._backoff = Math.min(this._backoff * 2, 30000);
-      }
+    this._socket.onclose = () => {
+      if (this._closing) return;
+      setTimeout(() => this.connect(), this._backoff);
+      this._backoff = Math.min(this._backoff * 2, 30000);
     };
 
-    this._ws.onerror = err => {
-      console.warn('[WS] error:', err);
-    };
+    this._socket.onerror = () => this._socket?.close();
+  }
+
+  _applySnapshot(message) {
+    this._trains.clear();
+    for (const train of message.trains) this._trains.set(train.trip_id, train);
+  }
+
+  _applyDelta(message) {
+    for (const change of message.upsert ?? []) {
+      const existing = this._trains.get(change.trip_id);
+      // Merge: a delta names only what moved, so spread over the last known state.
+      this._trains.set(change.trip_id,
+        existing ? { ...existing, ...change } : change);
+    }
+    for (const tripId of message.remove ?? []) this._trains.delete(tripId);
   }
 
   disconnect() {
-    this._intentionalClose = true;
-    this._ws?.close();
+    this._closing = true;
+    this._socket?.close();
   }
 }
